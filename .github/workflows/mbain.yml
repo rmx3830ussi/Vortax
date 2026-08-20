@@ -1,0 +1,1299 @@
+# ============================================================
+# CHANGELOG (manual — keep this updated as we iterate)
+#
+# V2.3 BETA
+# - Fixed: extracted .img files were blindly renamed to .qcow2
+#   without conversion (extension lied about actual content,
+#   causing QEMU to fail or misread the disk on boot).
+#   Now the real format is detected with `qemu-img info` and
+#   handled correctly:
+#     - true qcow2   -> moved as-is
+#     - true raw     -> kept as .img, booted with format=raw
+#     - anything else-> converted to qcow2 for compatibility
+# - Added: boot_mode "img" for raw disk images that are meant
+#   to be booted directly (e.g. Batocera), which does NOT get
+#   converted to qcow2.
+# - Added: IMG_URLS map + batocera entry as the first raw-img
+#   system.
+# - Added: gzip vs tar.gz detection. A plain single-file .gz
+#   (like batocera's *.img.gz) is NOT a tar archive and
+#   `tar -xf` fails on it — now detected via `tar -tzf` and
+#   extracted with gunzip when it isn't a real tarball.
+# - Added: fallback detection for when the *downloaded file
+#   itself* (not inside an archive) is already a raw/qcow2
+#   disk image with no recognizable iso/archive mime type.
+# - Changed: "Run the VM" no longer has 4 duplicated ~30-line
+#   QEMU command blocks (UEFI/BIOS x ISO/no-ISO). It now builds
+#   one QEMU_ARGS bash array and appends conditionally. This is
+#   the extension point for new flags going forward (joystick
+#   passthrough, extra devices, etc.) — add them to the array
+#   instead of duplicating a whole command block.
+# - Added: network_card input so the NIC model (e1000, virtio-
+#   net-pci, rtl8139, e1000e...) is configurable instead of
+#   hardcoded to e1000.
+# - Added: extra_qemu_args free-text input, appended verbatim
+#   to the QEMU command — a quick way to try new flags without
+#   editing the workflow file each time.
+# - Fixed: OVMF firmware download now only runs in UEFI mode
+#   instead of unconditionally on every run.
+#
+# - Added: RustDesk and AnyDesk as connection_program options,
+#   installed alongside XFCE like the existing RDP/NoMachine
+#   path. Firewall rules opened for their default ports.
+# - Added: RustDesk/AnyDesk get their access password from the
+#   existing vnc_password input (reused, not duplicated) — no
+#   hardcoded credentials anywhere in this workflow.
+# - Changed: the ngrok/bore tunnel step now skips entirely for
+#   RustDesk/AnyDesk, since both connect out through their own
+#   relay network rather than needing an inbound port forwarded.
+# - Fixed: vnc_password is now optional. If left blank, VNC
+#   starts with password=off instead of auth being silently
+#   skipped while still claiming "password on" in the args.
+#
+# - Added: Tailscale SSH (--ssh flag) plus openssh-server, so
+#   the runner is reachable via `tailscale ssh user@host` with
+#   no password (auth goes through tailnet identity) or plain
+#   password SSH as a fallback.
+# - Added: remote_access_password input, a password dedicated
+#   to RustDesk/AnyDesk separate from vnc_password (their access
+#   policy is stricter than a throwaway VNC session password).
+# - Changed: RustDesk/AnyDesk password resolution is now a
+#   fallback chain — remote_access_password, then vnc_password,
+#   then an auto-generated one-time password printed only in
+#   that run's own log. Unlike VNC, these two can't run with no
+#   password at all on a headless box (nobody's there to accept
+#   the connection), so an empty input no longer means "skip
+#   auth" for them — it means "generate one for this run."
+#
+# - Added: legacy_profile input (none, winnt4, winme, win2000),
+#   sourced from the Computernewb QEMU install guides for each.
+#   Forces BIOS mode (these predate UEFI), swaps in the correct
+#   CPU model, VGA device, NIC model, RAM, and disk size, and
+#   drops virtio/USB devices these guests have no drivers for.
+#   Windows Me specifically runs without KVM (-accel kvm is
+#   skipped) since the guide reports frequent lockups/BSODs
+#   under KVM on Me — NT4 and Win2000 do use KVM.
+#   Caveat: smp is left at the global default (2) — these are
+#   uniprocessor-era OSes; if boot is flaky, try extra_qemu_args
+#   or lower it and open an issue so we can wire a per-profile
+#   override.
+#
+# - Fixed: real bug found on a live run — Batocera's .img.gz
+#   download crashed with an unzip error. Root cause: file
+#   --mime-type reports .gz as "application/gzip", and the old
+#   chained `[[ ... == *"zip"* ]]` check ran BEFORE the gzip
+#   check — "gzip" contains the literal substring "zip", so
+#   every .gz file matched the zip branch first and got handed
+#   to `unzip`, which can't open it. Replaced the whole file-
+#   type dispatch with a `case` statement (stops at first match,
+#   ordered gzip-before-zip, no more silent substring collision)
+#   and factored the repeated post-extraction disk-detection
+#   logic into a `handle_extracted_disk` function instead of
+#   duplicating it once per archive type.
+#
+# - Added: aria2 -> wget -> curl download fallback chain for the
+#   direct-URL download path. aria2 runs first (16 parallel
+#   connections, noticeably faster on large images/ISOs); if it
+#   fails, wget is tried; if that also fails, curl. Only stops
+#   the job if all three fail or the result is an empty file —
+#   previously a single wget failure would silently continue
+#   with no source file at all.
+#
+# - Fixed: another live-run bug — Batocera's gunzip step failed
+#   with "Permission denied" writing into /mnt/tmp_unpack. Cause:
+#   `sudo gunzip ... > file` only runs gunzip as root — the `>`
+#   redirect itself is done by the calling (unprivileged) shell,
+#   which sudo never covers. TEMP_PATH is root-owned (created via
+#   sudo mkdir, no chmod, unlike /mnt/tmp and /mnt/cache which
+#   already get chmod 777 in the first step). Fixed both the
+#   underlying cause (TEMP_PATH now gets the same chmod 777 as
+#   the other /mnt temp dirs) and the specific line (swapped the
+#   bare redirect for `sudo tee`, which actually runs as root).
+#
+# - Added: batocera legacy_profile preset. Root cause of the
+#   "no screens found" Xorg crash on a real run: no explicit GPU
+#   device meant the guest had no /dev/dri/card0 for Batocera's
+#   own X server (needs DRM/KMS) to bind to. Added -vga virtio
+#   -device virtio-gpu-pci, matching Batocera's own runQemu.sh
+#   exactly, plus its intel-hda audio, nec-usb-xhci controller,
+#   and :5555 SSH port-forward. Deliberately skipped: that
+#   script's joystick passthrough — a GitHub-hosted runner has no
+#   physical USB gamepad for it to find.
+# - Fixed: a YAML syntax bug in my own prior edit — used bash-
+#   style quote escaping ('"'"') inside a YAML single-quoted
+#   string instead of YAML's own escaping (a doubled '' ). Would
+#   have broken workflow parsing entirely on the next push.
+#
+# - Fixed: batocera profile still showed the same "no screens
+#   found" crash after the first attempt at this fix, because
+#   `-vga virtio` + a separate `-device virtio-gpu-pci` gives the
+#   guest two competing virtio display devices — Xorg was very
+#   likely binding the legacy-compatible one instead of the one
+#   that actually exposes /dev/dri/card0. Changed to `-vga none
+#   -device virtio-gpu-pci` so there's exactly one, unambiguous
+#   primary display device.
+#
+# KNOWN ISSUES (not fixed yet, flagging so we don't lose them)
+# - MEGA_EMAIL / MEGA_PASSWORD are referenced in the final
+#   upload step but never defined from secrets.* anywhere in
+#   the env block — that step will fail or upload with empty
+#   credentials until secrets.MEGA_EMAIL / secrets.MEGA_PASSWORD
+#   are wired in.
+# - Most install/download steps still redirect to /dev/null
+#   2>&1, which hides real failures instead of surfacing them.
+# - "runtime" default (325) doesn't match its own description
+#   text ("default 350").
+# ============================================================
+
+name: Qemu-Vortax V2.3 BETA
+
+on:
+  workflow_dispatch:
+    inputs:
+      system_choice:
+        description: 'Choose a ready system (bazite, bliss, centos_qcow2, cutefish, debian_qcow2, deepin, garuda_mokka, kali, manjaro, mint, pear, pop_os, ubuntu, win11, win10, win8.1, win7, Vista, XP, batocera)'
+        required: false
+        default: ''
+      boot_mode:
+        description: 'Choose boot type: iso, qcow2, or img (raw disk image, e.g. Batocera)'
+        required: true
+        default: 'qcow2'
+      source_url:
+        description: 'Custom source URL (optional)'
+        required: false
+        default: ''
+      vm_name:
+        description: 'Name of the system/disk'
+        required: true
+        default: 'Qemu'
+      runtime:
+        description: 'Runtime duration in minutes (default 350)'
+        required: false
+        default: '325'
+      connection_method:
+        description: 'Choose connection method: tailscale or ngrok or bore'
+        required: true
+        default: 'bore'
+      connection_program:
+        description: 'Select program (RDP, VNC, NoMachine, RustDesk, AnyDesk)'
+        required: true
+        default: 'VNC'
+      bios_mode:
+        description: 'Choose firmware mode: UEFI or BIOS (default UEFI)'
+        required: true
+        default: 'BIOS'
+      vnc_password:
+        description: 'Access password for VNC/RustDesk/AnyDesk. Leave blank to run without a password (not recommended for anything but quick local testing).'
+        required: false
+        default: 'runner'
+      upload_qcow2:
+        description: 'Upload QCOW2 file to Mega: yes or no'
+        required: true
+        default: 'yes'
+      network_card:
+        description: 'Network card model (e1000, virtio-net-pci, rtl8139, e1000e)'
+        required: false
+        default: 'e1000'
+      extra_qemu_args:
+        description: 'Optional extra raw QEMU args appended verbatim (advanced/testing)'
+        required: false
+        default: ''
+      remote_access_password:
+        description: 'Optional dedicated password for RustDesk/AnyDesk unattended access. Falls back to vnc_password if blank, or to an auto-generated one-time password (printed in this run''s log) if both are blank — unattended access needs a real password on a headless box.'
+        required: false
+        default: ''
+      legacy_profile:
+        description: 'Hardware preset (none, winnt4, winme, win2000, win98, win95, win31, win1x, win2x, batocera). Old-Windows presets override CPU/VGA/network/RAM to period-accurate values and force BIOS mode. win95/win31/win1x/win2x install from floppy — see legacy_floppy_url. batocera adds the virtio-gpu device its own Xorg needs (fixes a "no screens found" crash) plus audio and an SSH port-forward, matching Batocera''s own runQemu.sh.'
+        required: false
+        default: 'none'
+      legacy_floppy_url:
+        description: 'URL to a floppy (.ima) image for win95/win31/win1x/win2x — patcher9x boot floppy for win95, DOS/Windows install floppy for the rest. Bring your own legally-obtained copy; none is bundled.'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  setup-and-run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      USERNAME: runner
+      PASSWORD: runner
+      TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+      NGROK_AUTH: ${{ secrets.NGROK_AUTH }}
+      FINAL_SOURCE_URL: ''
+      RUNNER_TEMP: /mnt/tmp
+      ACTIONS_RUNNER_CACHE: /mnt/cache
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Prepare user and sudo
+        run: |
+          echo "Setting password for user..."
+          echo "${USERNAME}:${PASSWORD}" | sudo chpasswd > /dev/null 2>&1
+          echo "Configuring sudoers..."
+          echo "${USERNAME} ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/${USERNAME} > /dev/null 2>&1
+          echo "Creating temp directories..."
+          sudo mkdir -p /mnt/tmp /mnt/cache > /dev/null 2>&1
+          echo "Fixing permissions for temp directories..."
+          sudo chmod -R 777 /mnt/tmp /mnt/cache > /dev/null 2>&1
+
+      - name: Setup Connection (Tailscale or Ngrok)
+        run: |
+          METHOD="${{ github.event.inputs.connection_method }}"
+          if [ "$METHOD" = "tailscale" ]; then
+            echo "Installing OpenSSH server (for Tailscale SSH)..."
+            sudo apt-get update -qq > /dev/null 2>&1
+            sudo apt-get install -y -qq openssh-server > /dev/null 2>&1
+            sudo systemctl enable --now ssh > /dev/null 2>&1
+            echo "Installing Tailscale..."
+            curl -fsSL https://tailscale.com/install.sh | sudo sh > /dev/null 2>&1
+            echo "Starting Tailscale (with Tailscale SSH enabled)..."
+            sudo tailscale up --authkey "${TAILSCALE_AUTHKEY}" --hostname "gh-xfce-vm-${{ github.run_id }}" --accept-routes --accept-dns=false --ssh
+            TS_IP=$(sudo tailscale ip -4 | head -n1)
+            echo "CONNECTION_IP=$TS_IP" >> $GITHUB_ENV
+            echo "CONNECTION_TYPE=Tailscale" >> $GITHUB_ENV
+            echo "Tailscale SSH is enabled — from another device on your tailnet: tailscale ssh ${USERNAME}@gh-xfce-vm-${{ github.run_id }}"
+            echo "(No password needed for that — auth goes through your tailnet identity. Password SSH also works as a fallback: ssh ${USERNAME}@${TS_IP})"
+          elif [ "$METHOD" = "ngrok" ]; then
+            echo "Downloading Ngrok..."
+            wget -q -O ngrok.zip https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-linux-amd64.zip > /dev/null 2>&1
+            echo "Extracting Ngrok..."
+            unzip -q ngrok.zip > /dev/null 2>&1
+            echo "Installing Ngrok..."
+            sudo mv ngrok /usr/local/bin/ > /dev/null 2>&1
+            echo "Configuring Ngrok auth..."
+            ngrok config add-authtoken "${NGROK_AUTH}"
+            echo "CONNECTION_TYPE=Ngrok" >> $GITHUB_ENV
+          elif [ "$METHOD" = "bore" ]; then 
+            echo "Installing bore-cli..."
+            cargo install bore-cli > /dev/null 2>&1
+            echo "$HOME/.cargo/bin" >> $GITHUB_PATH 
+            echo "CONNECTION_TYPE=Bore" >> $GITHUB_ENV
+          else
+            exit 1
+          fi
+
+      - name: Install XFCE + RDP + NoMachine
+        run: |
+
+          PROGRAM="${{ github.event.inputs.connection_program }}"
+          UPLOAD_QCOW2="${{ github.event.inputs.upload_qcow2 }}"
+          
+          echo "Updating package lists..."
+          sudo apt-get update -qq > /dev/null 2>&1
+          
+          if [[ "$UPLOAD_QCOW2" == "yes" ]]; then
+            echo "Installing MegaTools + pip..."
+            sudo apt install -y megatools python3-pip > /dev/null 2>&1
+            echo "Installing Python libs..."
+            pip install rich requests > /dev/null 2>&1
+            echo "Downloading Mega CLI..."
+            curl -L "https://gitlab.com/MR.English2008/Mega_Gen/-/raw/main/maga_gen_cli.py" -o mega_gen_cli.py > /dev/null 2>&1
+            chmod +x mega_gen_cli.py > /dev/null 2>&1
+            echo "Running Mega CLI..."
+            python3 mega_gen_cli.py > /dev/null 2>&1
+          fi
+          
+          echo "Downloading virtio-win.iso "
+          sudo wget -O /mnt/virtio-win.iso "https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/archive-virtio/virtio-win-0.1.96/virtio-win.iso" > /dev/null 2>&1
+          echo "Installing VNC, wmctrl, wget, IA..."
+          sudo apt-get install -y jq tigervnc-viewer wmctrl internetarchive genisoimage > /dev/null 2>&1
+          
+          if [ "$PROGRAM" = "NoMachine" ]; then
+            echo "Downloading NoMachine..."
+            wget -q https://web9001.nomachine.com/download/9.2/Linux/nomachine_9.2.18_3_amd64.deb -O nomachine.deb > /dev/null 2>&1
+            echo "Installing NoMachine..."
+            sudo dpkg -i nomachine.deb > /dev/null 2>&1 || sudo apt-get -f install -y > /dev/null 2>&1
+            rm nomachine.deb > /dev/null 2>&1
+          fi
+          
+          if [ "$PROGRAM" = "RDP" ]; then
+            echo "Installing XRDP..."
+            sudo apt-get install -y -qq xrdp > /dev/null 2>&1
+          fi
+
+          if [ "$PROGRAM" = "RustDesk" ]; then
+            echo "Downloading RustDesk..."
+            wget -q https://github.com/rustdesk/rustdesk/releases/download/1.4.9/rustdesk-1.4.9-x86_64.deb -O rustdesk.deb > /dev/null 2>&1
+            echo "Installing RustDesk..."
+            sudo dpkg -i rustdesk.deb > /dev/null 2>&1 || sudo apt-get -f install -y > /dev/null 2>&1
+            rm -f rustdesk.deb
+          fi
+
+          if [ "$PROGRAM" = "AnyDesk" ]; then
+            echo "Downloading AnyDesk..."
+            wget -q https://download.anydesk.com/linux/anydesk_8.0.4-1_amd64.deb -O anydesk.deb > /dev/null 2>&1
+            echo "Installing AnyDesk..."
+            sudo dpkg -i anydesk.deb > /dev/null 2>&1 || sudo apt-get -f install -y > /dev/null 2>&1
+            rm -f anydesk.deb
+          fi
+          
+          if [ "$PROGRAM" = "RDP" ] || [ "$PROGRAM" = "NoMachine" ] || [ "$PROGRAM" = "RustDesk" ] || [ "$PROGRAM" = "AnyDesk" ]; then
+            echo "Installing XFCE "
+            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq xfce4 xfce4-goodies xorg dbus-x11 > /dev/null 2>&1
+            echo "Configuring .xsession..."
+            echo "startxfce4" | sudo tee /home/${USERNAME}/.xsession > /dev/null 2>&1
+            sudo chown ${USERNAME}:${USERNAME} /home/${USERNAME}/.xsession > /dev/null 2>&1
+            echo "Configuring system xsession..."
+            echo "exec startxfce4" | sudo tee /etc/skel/.xsession > /dev/null 2>&1
+            echo "startxfce4" | sudo tee /etc/skel/.xinitrc > /dev/null 2>&1
+          fi
+          
+          if [ "$PROGRAM" = "NoMachine" ]; then
+            echo "Configuring firewall. nomachine"
+            sudo ufw allow 4000/tcp > /dev/null 2>&1
+            sudo ufw allow 4011:4999/tcp > /dev/null 2>&1
+          fi
+          
+          echo "Configuring firewall. VNC"
+          sudo ufw allow 5900/tcp > /dev/null 2>&1
+
+          if [ "$PROGRAM" = "RustDesk" ]; then
+            echo "Configuring firewall. RustDesk"
+            sudo ufw allow 21115:21119/tcp > /dev/null 2>&1
+            sudo ufw allow 21116/udp > /dev/null 2>&1
+          fi
+
+          if [ "$PROGRAM" = "AnyDesk" ]; then
+            echo "Configuring firewall. AnyDesk"
+            sudo ufw allow 6568/tcp > /dev/null 2>&1
+          fi
+
+          sudo ufw --force enable > /dev/null 2>&1 || true
+          
+          if [ "$PROGRAM" = "RDP" ]; then
+            echo "Configuring firewall. xrdp "
+            sudo ufw allow 3389/tcp > /dev/null 2>&1
+            sudo ufw --force enable > /dev/null 2>&1 || true
+            echo "Starting XRDP..."
+            sudo systemctl enable --now xrdp > /dev/null 2>&1
+            sudo systemctl restart xrdp > /dev/null 2>&1
+          fi
+
+      - name: Install QEMU and components
+        run: |
+          echo "Updating package lists..."
+          sudo apt-get update -qq > /dev/null 2>&1
+          echo "Installing QEMU + components..."
+          sudo apt-get install -y -qq qemu-system-x86 ovmf novnc websockify wget curl aria2 unzip p7zip-full unrar-free tar python3-pip > /dev/null 2>&1
+          echo "Installing internetarchive..."
+          pip install internetarchive > /dev/null 2>&1
+          echo "Cloning badown..."
+          git clone https://github.com/stck-lzm/badown ~/badown > /dev/null 2>&1
+          chmod +x ~/badown/badown > /dev/null 2>&1
+          sudo touch ~/badown/.badown.tmp > /dev/null 2>&1
+          
+      - name: Determine source URL
+        id: determine_url
+        run: |
+          CHOICE="${{ github.event.inputs.system_choice }}"
+          USER_URL="${{ github.event.inputs.source_url }}"
+          BOOT_MODE="${{ github.event.inputs.boot_mode }}"
+          FINAL_URL="$USER_URL"
+
+          declare -A ISO_URLS
+          ISO_URLS["bazite"]="https://download.bazzite.gg/bazzite-stable-live.iso"
+          ISO_URLS["bliss"]="https://dn720203.ca.archive.org/0/items/Bliss-v15.9-x86_64-OFFICIAL-gapps-20240114/Bliss-v15.9-x86_64-OFFICIAL-gapps-20240114.iso"
+          ISO_URLS["cutefish"]="https://netix.dl.sourceforge.net/project/cutefish-ubuntu/ISO/Ubuntu/CutefishOS-22.04.0-YoYo-beta-amd64.iso?viasf=1"
+          ISO_URLS["debian"]="https://cdimage.debian.org/debian-cd/current/amd64/iso-dvd/debian-13.2.0-amd64-DVD-1.iso"
+          ISO_URLS["deepin"]="https://cdimage-cdn77.deepin.com/deepin-cd/25.0.1/amd64/deepin-desktop-community-25.0.1-amd64.iso"
+          ISO_URLS["elementary"]="https://www.mediafire.com/file/vhk0q3w23kckfgg/elementary.iso"
+          ISO_URLS["fedora"]="https://mirror.slu.cz/fedora/linux/releases/43/KDE/x86_64/iso/Fedora-KDE-Desktop-Live-43-1.6.x86_64.iso"
+          ISO_URLS["garuda"]="https://iso.builds.garudalinux.org/iso/latest/garuda/mokka/latest.iso?r2=1"
+          ISO_URLS["kali"]="https://kali.download/base-images/kali-2025.3/kali-linux-2025.3-live-amd64.iso"
+          ISO_URLS["manjaro"]="https://download.manjaro.org/gnome/25.0.10/manjaro-gnome-25.0.10-251013-linux612.iso"
+          ISO_URLS["mint"]="https://pub.linuxmint.io/stable/22.2/linuxmint-22.2-cinnamon-64bit.iso"
+          ISO_URLS["pear"]="https://www.mediafire.com/file/7ztcyqd2ggiv58p/pearOS-NiceC0re-2025.11-x86_64.iso"
+          ISO_URLS["pop_os"]="https://iso.pop-os.org/22.04/amd64/intel/58/pop-os_22.04_amd64_intel_58.iso"
+          ISO_URLS["ubuntu"]="https://releases.ubuntu.com/25.10/ubuntu-25.10-desktop-amd64.iso"
+          ISO_URLS["Vista"]="https://computernewb.com/isos/windows/Windows%20Vista%20SP2%20x64.iso"
+          ISO_URLS["win7"]="https://computernewb.com/isos/windows/en_windows_7_ultimate_with_sp1_x64_dvd_u_677332.iso"
+          ISO_URLS["win8.1"]="https://computernewb.com/isos/windows/en_windows_embedded_8_1_industry_enterprise_x64_dvd_2710518.iso"
+          ISO_URLS["win10"]="https://computernewb.com/isos/windows/en-us_windows_10_iot_enterprise_ltsc_2021_x64_dvd_257ad90f.iso"
+          ISO_URLS["win11"]="https://computernewb.com/isos/windows/en-us_windows_11_iot_enterprise_ltsc_2024_x64_dvd_f6b14814.iso"
+          ISO_URLS["winux"]="https://netix.dl.sourceforge.net/project/windows-linux/winux-11.25.11-noble-lts.iso?viasf=1"
+          ISO_URLS["XP"]="https://archive.org/download/windows-xp-all-sp-msdn-iso-files-en-de-ru-tr-x86-x64/en_win_xp_pro_x64_with_sp2_vl_x13-41611.iso"
+          ISO_URLS["zorin"]="https://fosszone.csd.auth.gr/zorinos/18/Zorin-OS-18-Core-64-bit.iso"
+          
+          declare -A QCOW2_URLS
+          QCOW2_URLS["bliss"]="https://www.mediafire.com/file/2zuxhk4dtqa735l/bliss.7z/"
+          QCOW2_URLS["cutefish"]="https://www.mediafire.com/file/cskqtp25wya8p4e/cutefish.7z"
+          QCOW2_URLS["debian"]="https://www.mediafire.com/file/4x02re7l2ge3a6h/debian.7z"
+          QCOW2_URLS["deepin"]="https://www.mediafire.com/file/ozwa2vyxt4hz6wu/dipeen.7z/"
+          QCOW2_URLS["elementary"]="https://www.mediafire.com/file/thxygwj4msofcw7/elementary.7z"
+          QCOW2_URLS["fedora"]="https://www.mediafire.com/file/5gora3zva802ia9/fedora.7z"
+          QCOW2_URLS["garuda"]="https://www.mediafire.com/file/4qpifo9ncfxon1z/garuda.7z"
+          QCOW2_URLS["kali"]="https://kali.mirror.garr.it/kali-images/current/kali-linux-2025.3-qemu-amd64.7z"
+          QCOW2_URLS["manjaro"]="https://www.mediafire.com/file/ynn1o8flu6v8mhd/manjaro.7z"
+          QCOW2_URLS["mint"]="https://www.mediafire.com/file/a4qyactev4kzc0q/mint.7z/"
+          QCOW2_URLS["pop_os"]="https://www.mediafire.com/file/lbrebo479z4fq3g/pop_os.7z"
+          QCOW2_URLS["ubuntu"]="https://www.mediafire.com/file/m2x4f34hdxqfndd/ubuntu.7z"
+          QCOW2_URLS["Vista"]="https://www.mediafire.com/file/f9fqa9oupypugbo/Vista.7z"
+          QCOW2_URLS["win7"]="https://www.mediafire.com/file/py5c5n111ns72x0/win7.7z"
+          QCOW2_URLS["win8.1"]="https://www.mediafire.com/file/tn4ojkrkg2cbvcs/win8.1.7z"
+          QCOW2_URLS["win10"]="https://www.mediafire.com/file/uae3un0o27obbgv/win10.7z"
+          QCOW2_URLS["win11"]="https://www.mediafire.com/file/cfcaoebixpl0j8m/win11.7z"
+          QCOW2_URLS["winux"]="https://www.mediafire.com/file/jljgb4yt99clu5s/winux.7z"
+          QCOW2_URLS["XP"]="https://www.mediafire.com/file/nbfd1zer1zjnm7c/XP.7z"
+          QCOW2_URLS["zorin"]="https://www.mediafire.com/file/f7hkbwcd05fucyx/zorin.7z"
+
+          # Raw disk images meant to be booted directly (NOT converted
+          # to qcow2). Add new raw-boot systems here.
+          declare -A IMG_URLS
+          IMG_URLS["batocera"]="https://sour-silent-prune.6fcff5d8.katapult.cloud/images/batocera-x86_64-43.1-20260529.img.gz"
+
+          if [[ -z "$FINAL_URL" && -n "$CHOICE" ]]; then
+            if [[ "$BOOT_MODE" == "iso" ]]; then
+              FINAL_URL="${ISO_URLS[$CHOICE]}"
+            elif [[ "$BOOT_MODE" == "qcow2" ]]; then
+              FINAL_URL="${QCOW2_URLS[$CHOICE]}"
+            elif [[ "$BOOT_MODE" == "img" ]]; then
+              FINAL_URL="${IMG_URLS[$CHOICE]}"
+            fi
+          fi
+          
+          if [[ "$CHOICE" == "random" ]]; then
+            echo "Random system choice selected."
+            if [[ "$BOOT_MODE" == "iso" ]]; then
+              KEYS=("${!ISO_URLS[@]}")
+              CHOICE="${KEYS[RANDOM % ${#KEYS[@]}]}"
+              FINAL_URL="${ISO_URLS[$CHOICE]}"
+            elif [[ "$BOOT_MODE" == "img" ]]; then
+              KEYS=("${!IMG_URLS[@]}")
+              CHOICE="${KEYS[RANDOM % ${#KEYS[@]}]}"
+              FINAL_URL="${IMG_URLS[$CHOICE]}"
+            else
+              KEYS=("${!QCOW2_URLS[@]}")
+              CHOICE="${KEYS[RANDOM % ${#KEYS[@]}]}"
+              FINAL_URL="${QCOW2_URLS[$CHOICE]}"
+            fi
+            echo "Randomly selected system: $CHOICE"
+          fi
+
+          if [[ -z "$FINAL_URL" && -z "$USER_URL" ]]; then
+            FINAL_URL="${ISO_URLS["bliss"]}"
+            echo "::notice::No system choice provided. Defaulting to Bliss ISO."
+          fi
+
+          echo "FINAL_SOURCE_URL=$FINAL_URL" >> $GITHUB_ENV
+          
+      - name: Configure VM specs
+        run: |
+          DISK=60
+          if [ "${{ github.event.repository.private }}" = "true" ]; then
+            RAM=6
+          else
+            RAM=14
+          fi
+          VCPUS=2
+          echo "RAM=$RAM" >> $GITHUB_ENV
+          echo "DISK=$DISK" >> $GITHUB_ENV
+          echo "VCPUS=$VCPUS" >> $GITHUB_ENV
+          
+      - name: Prepare files and disks
+        run: |
+          MODE="${{ github.event.inputs.boot_mode }}"
+          SRC="${{ env.FINAL_SOURCE_URL }}"
+          VM="${{ github.event.inputs.vm_name }}"
+          DISK="${{ env.DISK }}"
+          HOME_PATH="$HOME"
+          MNT_PATH="/mnt"
+          TEMP_PATH="/mnt/tmp_unpack"
+          FILE_PATH="$TEMP_PATH/source_file"
+          sudo mkdir -p "$TEMP_PATH"
+          sudo chmod -R 777 "$TEMP_PATH"
+
+          if [[ "$SRC" == *"archive.org/download/"* ]]; then
+            echo "Detected Internet Archive source..."
+            ITEM=$(basename "$(dirname "$SRC")")
+            FILE=$(basename "$SRC")
+            CMD="ia download $ITEM $FILE"
+            echo "Downloading using: $CMD"
+            eval "$CMD"
+            FOUND_FILE=$(find . -type f -name "$FILE" | head -n1)
+            if [ -f "$FOUND_FILE" ]; then
+              sudo mv "$FOUND_FILE" "$FILE_PATH"
+            else
+              echo "Error: No valid file found from archive.org"
+              exit 1
+            fi
+          elif [[ "$SRC" == *"mediafire.com"* || "$SRC" == *"mega.nz"* ]]; then
+            echo "Using badown to download from: $SRC"
+            cd ~/badown
+            CACHE_FILE="/tmp/badown_cache.log"
+            : > "$CACHE_FILE"
+            (
+              sudo ./badown "$SRC" >"$CACHE_FILE" 2>&1 &
+              pid=$!
+              last_update=$(date +%s)
+              progress=""
+              while kill -0 $pid 2>/dev/null; do
+                now=$(date +%s)
+                if (( now - last_update >= 10 )); then
+                  new_progress=$(grep -Eo '[0-9]{1,3}%' "$CACHE_FILE" | tail -n1)
+                  if [[ -n "$new_progress" ]]; then
+                    progress="$new_progress"
+                    echo "Downloading... $progress"
+                  else
+                    echo "Downloading..."
+                  fi
+                  last_update=$now
+                fi
+                sleep 0.2
+              done
+              wait $pid
+            )
+            DOWNLOADED=$(ls -t | head -n1)
+            sudo mv "$DOWNLOADED" "$FILE_PATH"
+            
+          else
+            echo "Downloading system file (aria2 -> wget -> curl fallback chain)..."
+            DOWNLOAD_OK=false
+
+            echo "Attempting download via aria2 (parallel connections, fastest)..."
+            if sudo aria2c -x 16 -s 16 --user-agent="Mozilla/5.0" --allow-overwrite=true -d "$(dirname "$FILE_PATH")" -o "$(basename "$FILE_PATH")" "$SRC"; then
+              DOWNLOAD_OK=true
+            else
+              echo "::warning::aria2 download failed — falling back to wget."
+            fi
+
+            if [ "$DOWNLOAD_OK" = false ]; then
+              echo "Attempting download via wget..."
+              if sudo wget -q --user-agent="Mozilla/5.0" --trust-server-names --content-disposition -O "$FILE_PATH" "$SRC"; then
+                DOWNLOAD_OK=true
+              else
+                echo "::warning::wget download failed — falling back to curl."
+              fi
+            fi
+
+            if [ "$DOWNLOAD_OK" = false ]; then
+              echo "Attempting download via curl..."
+              if sudo curl -fsSL -A "Mozilla/5.0" -o "$FILE_PATH" "$SRC"; then
+                DOWNLOAD_OK=true
+              else
+                echo "::error::All three download methods (aria2, wget, curl) failed for $SRC"
+              fi
+            fi
+
+            if [ "$DOWNLOAD_OK" = false ] || [ ! -s "$FILE_PATH" ]; then
+              echo "::error::Download did not produce a usable file at $FILE_PATH — stopping here rather than continuing with a missing/empty source."
+              exit 1
+            fi
+          fi
+
+          EXT=$(file -b --mime-type "$FILE_PATH")
+
+          # Shared post-extraction handling: look for a disk image
+          # inside whatever archive we just extracted, detect its
+          # real format, and convert/rename accordingly. Called from
+          # every archive branch below instead of duplicated 5 times.
+          handle_extracted_disk() {
+            FOUND=$(find "$TEMP_PATH" -type f \( -iname "*.qcow2" -o -iname "*.img" -o -iname "*.raw" \) | head -n 1)
+            if [ -n "$FOUND" ]; then
+              REAL_FORMAT=$(sudo qemu-img info --output=json "$FOUND" | jq -r '.format')
+              echo "Detected disk image format: $REAL_FORMAT"
+              case "$REAL_FORMAT" in
+                qcow2)
+                  sudo mv "$FOUND" "$MNT_PATH/${VM}.qcow2"
+                  ;;
+                raw)
+                  # Raw disk images (e.g. Batocera) are meant to be
+                  # booted directly — converting would just be extra
+                  # I/O for no benefit.
+                  sudo mv "$FOUND" "$MNT_PATH/${VM}.img"
+                  ;;
+                *)
+                  echo "Converting $REAL_FORMAT image to qcow2 for compatibility..."
+                  sudo qemu-img convert -O qcow2 "$FOUND" "$MNT_PATH/${VM}.qcow2"
+                  sudo rm -f "$FOUND"
+                  REAL_FORMAT="qcow2"
+                  ;;
+              esac
+              echo "DISK_FORMAT=$REAL_FORMAT" >> $GITHUB_ENV
+            else
+              if [ ! -f "$HOME_PATH/${VM}.iso" ] && [ ! -f "$MNT_PATH/${VM}.qcow2" ] && [ ! -f "$MNT_PATH/${VM}.img" ]; then
+                ARCHIVE_FOUND=$(find "$TEMP_PATH" -type f -iname "*.tar.gz" -o -iname "*.tar" -o -iname "*.zip" -o -iname "*.7z" | head -n1)
+                if [ -n "$ARCHIVE_FOUND" ]; then
+                    mkdir -p "$TEMP_PATH/unpack"
+                    EXT2=$(file -b --mime-type "$ARCHIVE_FOUND")
+                    case "$EXT2" in
+                      *"zip"*)
+                        unzip -q "$ARCHIVE_FOUND" -d "$TEMP_PATH/unpack"
+                        ;;
+                      *"7z"*)
+                        7z x "$ARCHIVE_FOUND" -o"$TEMP_PATH/unpack" > /dev/null
+                        ;;
+                      *)
+                        tar -xf "$ARCHIVE_FOUND" -C "$TEMP_PATH/unpack"
+                        ;;
+                    esac
+                    mkisofs -o "$HOME_PATH/${VM}.iso" -b boot/isolinux/isolinux.bin -c boot/isolinux/boot.cat -no-emul-boot -boot-load-size 4 -boot-info-table -J -R "$TEMP_PATH/unpack"
+                    rm -rf "$TEMP_PATH/unpack"
+                    echo "DISK_FORMAT=qcow2" >> $GITHUB_ENV
+                else
+                  echo "::warning::No disk image or installer archive found inside the extracted contents of $FILE_PATH."
+                fi
+              fi
+            fi
+          }
+
+          # ------------------------------------------------------------
+          # Dispatch by detected file type. This is a `case`, not a
+          # chain of `[[ ... == *pattern* ]]` checks, on purpose:
+          # `file --mime-type` reports .gz files as "application/gzip",
+          # and "gzip" contains the literal substring "zip" — a
+          # wildcard zip check placed before the gzip check will match
+          # gzip files too and hand them to `unzip`, which is exactly
+          # what broke Batocera's .img.gz download previously. `case`
+          # stops at the first match, so ordering here is what matters:
+          # gzip is listed before zip and there's no ambiguity.
+          # ------------------------------------------------------------
+          case "$EXT" in
+            *"iso"*)
+              # Installer media — move as .iso and create a blank
+              # target disk for it to install onto.
+              sudo mv "$FILE_PATH" "$HOME_PATH/${VM}.iso"
+              sudo qemu-img create -f qcow2 "$MNT_PATH/${VM}.qcow2" "${DISK}G"
+              echo "DISK_FORMAT=qcow2" >> $GITHUB_ENV
+              ;;
+
+            *"gzip"*)
+              # A .gz can be a tar.gz archive OR a single compressed
+              # file (e.g. Batocera's *.img.gz). tar -xf fails on the
+              # latter, so test with tar -tzf before deciding.
+              cd "$TEMP_PATH"
+              if tar -tzf "$FILE_PATH" >/dev/null 2>&1; then
+                echo "Detected tar.gz archive, extracting with tar..."
+                sudo tar -xzf "$FILE_PATH"
+              else
+                echo "Detected plain .gz (single file), extracting with gunzip..."
+                sudo gunzip -c "$FILE_PATH" | sudo tee "$TEMP_PATH/${VM}_extracted.img" > /dev/null
+              fi
+              handle_extracted_disk
+              ;;
+
+            *"zip"*)
+              cd "$TEMP_PATH"
+              sudo unzip -q "$FILE_PATH" -d "$TEMP_PATH"
+              handle_extracted_disk
+              ;;
+
+            *"7z"*)
+              cd "$TEMP_PATH"
+              sudo 7z x -y "$FILE_PATH" > /dev/null
+              handle_extracted_disk
+              ;;
+
+            *"rar"*)
+              cd "$TEMP_PATH"
+              sudo unrar x -inul "$FILE_PATH"
+              handle_extracted_disk
+              ;;
+
+            *"tar"*)
+              cd "$TEMP_PATH"
+              sudo tar -xf "$FILE_PATH"
+              handle_extracted_disk
+              ;;
+
+            *)
+              # Not recognized as iso/archive — check if the downloaded
+              # file is already a raw or qcow2 disk image itself (e.g.
+              # a direct, uncompressed .img download).
+              REAL_FORMAT=$(sudo qemu-img info --output=json "$FILE_PATH" 2>/dev/null | jq -r '.format' 2>/dev/null)
+              if [ "$REAL_FORMAT" = "qcow2" ]; then
+                sudo mv "$FILE_PATH" "$MNT_PATH/${VM}.qcow2"
+                echo "DISK_FORMAT=qcow2" >> $GITHUB_ENV
+              elif [ -n "$REAL_FORMAT" ] && [ "$REAL_FORMAT" != "null" ]; then
+                sudo mv "$FILE_PATH" "$MNT_PATH/${VM}.img"
+                echo "DISK_FORMAT=$REAL_FORMAT" >> $GITHUB_ENV
+              else
+                echo "::warning::Could not determine file type for $FILE_PATH (detected as: $EXT) — leaving as-is at $FILE_PATH."
+              fi
+              ;;
+          esac
+
+          sudo rm -rf "$TEMP_PATH"
+
+          
+      - name: Upload badown log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: badown_cache_log
+          path: /tmp/badown_cache.log
+
+      - name: Run the VM
+        run: |
+          MODE="${{ github.event.inputs.boot_mode }}"
+          BIOS_MODE="${{ github.event.inputs.bios_mode }}"
+          VM="${{ github.event.inputs.vm_name }}"
+          VCPUS="${{ env.VCPUS }}"
+          RAM="${{ env.RAM }}"
+          DISK="${{ env.DISK }}"
+          NETWORK_CARD="${{ github.event.inputs.network_card }}"
+          EXTRA_ARGS="${{ github.event.inputs.extra_qemu_args }}"
+          HOME_PATH="$HOME"
+          MNT_PATH="/mnt"
+          ISO_PATH="$HOME_PATH/${VM}.iso"
+
+          DISK_FORMAT="${{ env.DISK_FORMAT }}"
+          if [ -z "$DISK_FORMAT" ]; then
+            echo "::warning::DISK_FORMAT was not set by the previous step — defaulting to qcow2."
+            DISK_FORMAT="qcow2"
+          fi
+
+          if [ "$DISK_FORMAT" = "raw" ]; then
+            DISK_PATH="$MNT_PATH/${VM}.img"
+          else
+            DISK_PATH="$MNT_PATH/${VM}.qcow2"
+          fi
+
+          if [ -z "$NETWORK_CARD" ]; then
+            NETWORK_CARD="e1000"
+          fi
+
+          VNC_PASS="${{ github.event.inputs.vnc_password }}"
+          if [ -n "$VNC_PASS" ]; then
+            VNC_OPT=":0,password=on"
+          else
+            echo "::warning::No password provided — VNC will run without authentication."
+            VNC_OPT=":0"
+          fi
+
+          # ------------------------------------------------------------
+          # Legacy OS hardware presets, sourced from the Computernewb
+          # QEMU install guides for each specific system. These are NOT
+          # arbitrary choices — old guests break on modern defaults:
+          #   - virtio has no drivers on any of these OSes
+          #   - UEFI didn't exist yet for anything on this list
+          #   - newer CPU models trigger a setup BSOD on NT4 and Win98
+          #   - Windows Me is explicitly unstable under KVM
+          #   - Win95/Win3.1/Win1.x/Win2.x install from FLOPPY, not CD —
+          #     these need legacy_floppy_url or they can't boot at all
+          # ------------------------------------------------------------
+          LEGACY_PROFILE="${{ github.event.inputs.legacy_profile }}"
+          LEGACY_FLOPPY_URL="${{ github.event.inputs.legacy_floppy_url }}"
+          LEGACY_ENABLE_KVM="yes"
+          LEGACY_RTC="-rtc base=localtime"
+          LEGACY_CPU=""
+          LEGACY_MACHINE=""
+          LEGACY_NET_MODEL="pcnet"
+          LEGACY_NETDEV_EXTRA=""
+          LEGACY_EXTRA_DEVICES=()
+          LEGACY_BOOT_MEDIUM="cdrom"   # cdrom | floppy
+
+          case "$LEGACY_PROFILE" in
+            winnt4)
+              LEGACY_CPU="pentium3"
+              LEGACY_MACHINE="pc,hpet=off"
+              LEGACY_VGA_ARGS=(-device VGA)
+              LEGACY_NET_MODEL="pcnet"
+              LEGACY_RAM_MB="128"
+              LEGACY_DISK_SIZE="4G"
+              # NT4 setup can't format a partition bigger than 4GB —
+              # capped here; use gparted afterward if you need more.
+              ;;
+            winme)
+              LEGACY_CPU="pentium3"
+              LEGACY_VGA_ARGS=(-vga cirrus)
+              LEGACY_NET_MODEL="pcnet"
+              LEGACY_RAM_MB="128"
+              LEGACY_DISK_SIZE="2G"
+              LEGACY_ENABLE_KVM="no"
+              # Guide is explicit: Me is highly unstable under KVM,
+              # frequent lockups/BSODs — run TCG (software) instead.
+              ;;
+            win2000)
+              LEGACY_CPU="host"
+              LEGACY_VGA_ARGS=(-vga cirrus)
+              LEGACY_NET_MODEL="pcnet"
+              LEGACY_RAM_MB="256"
+              LEGACY_DISK_SIZE="10G"
+              ;;
+            win98)
+              LEGACY_CPU="host"
+              LEGACY_MACHINE="pc,hpet=off,acpi=on,usb=on,accel=kvm"
+              LEGACY_VGA_ARGS=(-device "VGA,vgamem_mb=64")
+              LEGACY_NET_MODEL="rtl8139"
+              LEGACY_RAM_MB="256"
+              LEGACY_DISK_SIZE="4G"
+              LEGACY_EXTRA_DEVICES=(-device usb-tablet)
+              # accel=kvm is already inside -M above, so the generic
+              # "-accel kvm" append below is skipped for this profile
+              # to avoid passing it twice.
+              # Guide's troubleshooting note: a VXD/protection BSOD on
+              # first boot means this CPU model doesn't agree with
+              # Win98 — override via extra_qemu_args with -cpu
+              # core2duo (Intel host) or -cpu Opteron_G2 (AMD host).
+              ;;
+            win95)
+              LEGACY_CPU=""
+              LEGACY_VGA_ARGS=(-device "cirrus-vga,vgamem_mb=16")
+              LEGACY_NET_MODEL="pcnet"
+              LEGACY_RAM_MB=""
+              LEGACY_DISK_SIZE="700M"
+              LEGACY_BOOT_MEDIUM="floppy"
+              # Guide's command has no explicit -m — QEMU's own default
+              # applies unless you set one via extra_qemu_args.
+              # Needs the patcher9x boot floppy just to install/boot
+              # under KVM at all (JHRobotics/patcher9x on GitHub) —
+              # provide it via legacy_floppy_url. The actual multi-part
+              # install (fdisk, copy, patch9x -auto, reboot to boot
+              # disk, lock C:, setup /is) is done by hand over VNC,
+              # same as every other profile here — this only wires up
+              # correct hardware and boot order.
+              ;;
+            win31)
+              LEGACY_CPU="486"
+              LEGACY_VGA_ARGS=(-vga vmware)
+              LEGACY_NET_MODEL="rtl8139"
+              LEGACY_RAM_MB="16"
+              LEGACY_DISK_SIZE="150M"
+              LEGACY_EXTRA_DEVICES=(-usb -device usb-tablet -device sb16)
+              LEGACY_BOOT_MEDIUM="floppy"
+              LEGACY_ENABLE_KVM="no"
+              # Guide's command has no -accel/-enable-kvm at all —
+              # matched exactly rather than assuming it wants one.
+              # Installs entirely from DOS + floppies per the guide, no
+              # CD involved — provide the DOS boot floppy via
+              # legacy_floppy_url.
+              ;;
+            win1x|win2x)
+              LEGACY_CPU=""
+              LEGACY_VGA_ARGS=(-vga std)
+              LEGACY_NET_MODEL="none"
+              LEGACY_RAM_MB="1"
+              LEGACY_DISK_SIZE="32M"
+              LEGACY_BOOT_MEDIUM="floppy"
+              # DOS-hosted, installs from a single floppy — provide it
+              # via legacy_floppy_url. win1x guide uses -net none
+              # entirely; win2x's guide is nearly identical.
+              ;;
+            batocera)
+              LEGACY_CPU="host"
+              LEGACY_VGA_ARGS=(-vga none -device virtio-gpu-pci)
+              LEGACY_NET_MODEL="e1000"
+              LEGACY_NETDEV_EXTRA=",hostfwd=tcp::5555-:22"
+              LEGACY_RAM_MB="${RAM}000"
+              LEGACY_DISK_SIZE="8G"
+              LEGACY_EXTRA_DEVICES=(-device intel-hda -device hda-duplex -device nec-usb-xhci)
+              # Root cause of the "no screens found" Xorg crash: with
+              # no explicit GPU device, QEMU's default VGA gives the
+              # guest no /dev/dri/card0 — and Batocera's own X server
+              # needs DRM/KMS to bind to.
+              # NOTE: the official runQemu.sh combines -vga virtio with
+              # a *separate* -device virtio-gpu-pci — that gives the
+              # guest two competing virtio display devices (the legacy
+              # VGA-compatible one plus the standalone one), and Xorg
+              # can end up binding the wrong one. Using -vga none here
+              # instead so virtio-gpu-pci is the single, unambiguous
+              # primary display device — same underlying device the
+              # reference script uses, just without the duplicate.
+              # Also matches their intel-hda audio and the :5555 SSH
+              # port-forward from that same script.
+              # LEGACY_DISK_SIZE is effectively unused in the normal
+              # flow — Batocera ships as a complete pre-built disk
+              # image (via boot_mode=img), not something we create
+              # blank; it's only a fallback if that file is ever
+              # missing.
+              # Deliberately NOT wired: the official script's joystick
+              # passthrough (-device usb-host,vendorid=...) — a
+              # GitHub-hosted runner has no physical USB gamepad for
+              # it to find in the first place.
+              ;;
+            none|"")
+              LEGACY_PROFILE="none"
+              ;;
+            *)
+              echo "::warning::Unknown legacy_profile '$LEGACY_PROFILE' — ignoring, running with modern defaults."
+              LEGACY_PROFILE="none"
+              ;;
+          esac
+
+          if [ "$LEGACY_PROFILE" != "none" ] && [ "$BIOS_MODE" = "UEFI" ]; then
+            echo "::warning::$LEGACY_PROFILE's reference command doesn't use UEFI — forcing BIOS mode for this run to match it."
+            BIOS_MODE="BIOS"
+          fi
+
+          # Floppy download — only for profiles that need one. We don't
+          # hardcode a source for DOS/Windows 1.x/2.x/3.1 install media
+          # (still Microsoft's copyrighted software); point
+          # legacy_floppy_url at your own legally-obtained copy.
+          LEGACY_FLOPPY_PATH=""
+          if [ "$LEGACY_PROFILE" != "none" ] && [ -n "$LEGACY_FLOPPY_URL" ]; then
+            LEGACY_FLOPPY_PATH="$HOME_PATH/legacy_floppy.ima"
+            echo "Downloading floppy image for $LEGACY_PROFILE..."
+            sudo wget -q -O "$LEGACY_FLOPPY_PATH" "$LEGACY_FLOPPY_URL" || echo "::warning::Failed to download legacy_floppy_url"
+          fi
+
+          if [ "$LEGACY_PROFILE" != "none" ] && [ "$LEGACY_BOOT_MEDIUM" = "floppy" ] && [ -z "$LEGACY_FLOPPY_PATH" ]; then
+            echo "::warning::$LEGACY_PROFILE normally boots/installs from a floppy (legacy_floppy_url) — none provided, falling back to cdrom/hdd boot. Per the wiki guide this profile likely will not install correctly without it."
+            LEGACY_BOOT_MEDIUM="cdrom"
+          fi
+
+          # OVMF firmware is only needed for UEFI boots — no reason to
+          # fetch it on every BIOS run.
+          if [ "$BIOS_MODE" = "UEFI" ]; then
+            wget -q https://gitlab.com/MR.English2008/qemu-pre-build-ovfm.fd-files/-/raw/main/OVMF_CODE.fd -O OVMF_CODE.fd
+            wget -q https://gitlab.com/MR.English2008/qemu-pre-build-ovfm.fd-files/-/raw/main/OVMF_VARS.fd -O OVMF_VARS.fd
+            CODE_PATH=./OVMF_CODE.fd
+            VARS_PATH=./OVMF_VARS.fd
+            echo "OVMF firmware downloaded for UEFI boot"
+          fi
+
+          if [ ! -f "$DISK_PATH" ]; then
+            EFFECTIVE_DISK_SIZE="${DISK}G"
+            if [ "$LEGACY_PROFILE" != "none" ]; then
+              EFFECTIVE_DISK_SIZE="$LEGACY_DISK_SIZE"
+              echo "Legacy profile $LEGACY_PROFILE: creating a $EFFECTIVE_DISK_SIZE disk (period-appropriate size)."
+            fi
+            sudo qemu-img create -f "$DISK_FORMAT" "$DISK_PATH" "$EFFECTIVE_DISK_SIZE" || true
+          fi
+
+          # ------------------------------------------------------------
+          # Build the QEMU command as an array instead of four
+          # duplicated command blocks (UEFI/BIOS x ISO/no-ISO).
+          # To add new hardware/flags going forward (extra devices,
+          # joystick passthrough, sound, etc.), append to QEMU_ARGS
+          # here instead of copy-pasting a whole new block.
+          # ------------------------------------------------------------
+          if [ "$LEGACY_PROFILE" != "none" ]; then
+            EFFECTIVE_CPU="$LEGACY_CPU"
+            EFFECTIVE_MEM="${LEGACY_RAM_MB:-}"
+            EFFECTIVE_NET_DEVICE="${LEGACY_NET_MODEL}"
+          else
+            EFFECTIVE_CPU="host"
+            EFFECTIVE_MEM="${RAM}G"
+            EFFECTIVE_NET_DEVICE="${NETWORK_CARD}"
+          fi
+
+          QEMU_ARGS=(
+            -smp "${VCPUS}"
+            -vnc "${VNC_OPT}"
+            -monitor tcp:localhost:4444,server,nowait
+            -display none
+            -name "${VM}"
+          )
+
+          if [ -n "$EFFECTIVE_CPU" ]; then
+            QEMU_ARGS+=(-cpu "$EFFECTIVE_CPU")
+          fi
+
+          if [ -n "$EFFECTIVE_MEM" ]; then
+            QEMU_ARGS+=(-m "$EFFECTIVE_MEM")
+          fi
+
+          if [ "$LEGACY_PROFILE" != "none" ]; then
+            if [ "$LEGACY_ENABLE_KVM" = "yes" ] && [[ "$LEGACY_MACHINE" != *"accel="* ]]; then
+              QEMU_ARGS+=(-accel kvm)
+            fi
+            if [ -n "$LEGACY_MACHINE" ]; then
+              QEMU_ARGS+=(-M "${LEGACY_MACHINE}")
+            fi
+            QEMU_ARGS+=("${LEGACY_VGA_ARGS[@]}")
+            QEMU_ARGS+=(${LEGACY_RTC})
+            if [ "$LEGACY_NET_MODEL" = "none" ]; then
+              QEMU_ARGS+=(-net none)
+            else
+              QEMU_ARGS+=(-netdev "user,id=net0${LEGACY_NETDEV_EXTRA}" -device "${EFFECTIVE_NET_DEVICE},netdev=net0")
+            fi
+            if [ ${#LEGACY_EXTRA_DEVICES[@]} -gt 0 ]; then
+              QEMU_ARGS+=("${LEGACY_EXTRA_DEVICES[@]}")
+            fi
+            if [ -n "$LEGACY_FLOPPY_PATH" ]; then
+              QEMU_ARGS+=(-fda "$LEGACY_FLOPPY_PATH")
+            fi
+            # No virtio-win ISO, no virtio-era USB controller — none of
+            # that exists as a driver option on these guests.
+          else
+            QEMU_ARGS+=(
+              -enable-kvm
+              -netdev user,id=net0
+              -device "${EFFECTIVE_NET_DEVICE},netdev=net0"
+              -device usb-ehci,id=ehci
+              -device usb-tablet,bus=ehci.0
+              -drive file=/mnt/virtio-win.iso,media=cdrom,if=none,id=cd1
+              -device ide-cd,bus=ide.1,drive=cd1
+            )
+          fi
+
+          if [ "$BIOS_MODE" = "UEFI" ]; then
+            QEMU_ARGS+=(
+              -drive "if=pflash,format=raw,readonly=on,file=${CODE_PATH}"
+              -drive "if=pflash,format=raw,file=${VARS_PATH}"
+            )
+          fi
+
+          if [ "$LEGACY_PROFILE" != "none" ] && [ "$LEGACY_BOOT_MEDIUM" = "floppy" ] && [ -n "$LEGACY_FLOPPY_PATH" ]; then
+            QEMU_ARGS+=(-boot a)
+            if [ -f "$ISO_PATH" ]; then
+              QEMU_ARGS+=(-cdrom "$ISO_PATH")
+            fi
+          elif [ -f "$ISO_PATH" ]; then
+            QEMU_ARGS+=(-boot d -cdrom "$ISO_PATH")
+          else
+            QEMU_ARGS+=(-boot c)
+          fi
+
+          if [ "$BIOS_MODE" = "UEFI" ] && [ -f "$ISO_PATH" ]; then
+            # Matches the original UEFI+installer config: boot disk
+            # goes through virtio-blk-pci rather than plain -hda.
+            # (Legacy profiles never reach here — BIOS mode is forced
+            # above, so they always fall through to plain -hda below,
+            # matching the NT4/Me/2000 guides exactly.)
+            QEMU_ARGS+=(
+              -drive "if=none,id=hd0,file=${DISK_PATH},format=${DISK_FORMAT}"
+              -device virtio-blk-pci,drive=hd0
+            )
+          else
+            QEMU_ARGS+=(-hda "$DISK_PATH")
+          fi
+
+          if [ -n "$EXTRA_ARGS" ]; then
+            # shellcheck disable=SC2206
+            QEMU_ARGS+=(${EXTRA_ARGS})
+          fi
+
+          echo "Final QEMU command:"
+          echo "qemu-system-x86_64 ${QEMU_ARGS[*]}"
+
+          sudo qemu-system-x86_64 "${QEMU_ARGS[@]}" &
+
+          while ! nc -z localhost 4444; do
+            sleep 1
+          done
+
+          if [ -n "$VNC_PASS" ]; then
+            echo "change vnc password $VNC_PASS" | nc -q 1 localhost 4444
+            echo "VNC password applied successfully!"
+          else
+            echo "Skipping VNC password — none provided, connections are unauthenticated."
+          fi
+
+      - name: Create desktop VNC launcher
+        run: |
+          DESKTOP_PATH="/home/${USERNAME}/Desktop"
+          SCRIPT_PATH="${DESKTOP_PATH}/Connect_VNC.sh"
+          mkdir -p "$DESKTOP_PATH"
+          cat <<EOF > "$SCRIPT_PATH"
+          if [ "${{ env.CONNECTION_TYPE }}" = "Tailscale" ]; then
+            vncviewer ${{ env.CONNECTION_IP }}:5900 -FullScreen -MenuKey F8 &
+          else
+            vncviewer localhost:5900 -FullScreen -MenuKey F8 &
+          fi
+          sleep 3 && wmctrl -r "VNC Viewer" -b add,above
+          EOF
+          chmod +x "$SCRIPT_PATH"
+          chown ${USERNAME}:${USERNAME} "$SCRIPT_PATH"
+          echo "Desktop launcher created at: $SCRIPT_PATH"
+
+      - name: Configure RustDesk / AnyDesk access
+        if: ${{ github.event.inputs.connection_program == 'RustDesk' || github.event.inputs.connection_program == 'AnyDesk' }}
+        run: |
+          PROGRAM="${{ github.event.inputs.connection_program }}"
+          # Password priority: dedicated remote_access_password ->
+          # shared vnc_password -> auto-generated per-run.
+          # RustDesk/AnyDesk unattended access needs a real password
+          # on a headless box (there's no one at the desktop to click
+          # "accept"), so unlike VNC we don't allow this to stay blank.
+          ACCESS_PASS="${{ github.event.inputs.remote_access_password }}"
+          if [ -z "$ACCESS_PASS" ]; then
+            ACCESS_PASS="${{ github.event.inputs.vnc_password }}"
+          fi
+          if [ -z "$ACCESS_PASS" ]; then
+            ACCESS_PASS=$(openssl rand -base64 12 | tr -dc 'A-Za-z0-9' | head -c16)
+            echo "::notice::No password provided — generated a one-time password for this run's $PROGRAM access: $ACCESS_PASS"
+          fi
+
+          if [ "$PROGRAM" = "RustDesk" ]; then
+            sleep 5
+            RD_ID=$(sudo rustdesk --get-id 2>/dev/null || true)
+            echo "RustDesk ID: $RD_ID"
+            sudo rustdesk --password "$ACCESS_PASS" > /dev/null 2>&1 || true
+            echo "RustDesk permanent password set for this run."
+            echo "RUSTDESK_ID=$RD_ID" >> $GITHUB_ENV
+          fi
+
+          if [ "$PROGRAM" = "AnyDesk" ]; then
+            sleep 5
+            AD_ID=$(sudo anydesk --get-id 2>/dev/null || true)
+            echo "AnyDesk ID: $AD_ID"
+            echo "$ACCESS_PASS" | sudo anydesk --set-password > /dev/null 2>&1 || true
+            echo "AnyDesk unattended-access password set for this run."
+            echo "ANYDESK_ID=$AD_ID" >> $GITHUB_ENV
+          fi
+
+      - name: Expose selected port with Tunnel
+        if: ${{ (github.event.inputs.connection_method == 'ngrok' || github.event.inputs.connection_method == 'bore') && github.event.inputs.connection_program != 'RustDesk' && github.event.inputs.connection_program != 'AnyDesk' }}
+        run: |
+          METHOD="${{ github.event.inputs.connection_method }}"
+          PROGRAM="${{ github.event.inputs.connection_program }}"
+          
+          PORT=""
+          PROTOCOL=""
+          
+          if [ "$PROGRAM" = "RDP" ]; then
+            PORT=3389
+            PROTOCOL="RDP"
+          elif [ "$PROGRAM" = "VNC" ]; then
+            PORT=5900
+            PROTOCOL="VNC"
+          elif [ "$PROGRAM" = "NoMachine" ]; then
+            PORT=4000
+            PROTOCOL="NoMachine"
+          else
+            echo "::error::Invalid connection_program. Choose RDP, VNC, or NoMachine."
+            exit 1
+          fi
+
+          if [ "$METHOD" = "ngrok" ]; then
+            echo "Starting Ngrok tunnel for $PROTOCOL (Port $PORT)..."
+            nohup ngrok tcp $PORT --region=eu > ngrok_log.log 2>&1 &
+            sleep 10
+            
+            curl --silent http://127.0.0.1:4040/api/tunnels > tunnels.json
+            
+            TUNNEL_URL=$(jq -r ".tunnels[] | select(.config.addr==\"localhost:$PORT\") | .public_url" tunnels.json)
+            
+            if [ -z "$TUNNEL_URL" ]; then
+                echo "::error::Failed to get Ngrok public address. Check Ngrok authentication."
+                exit 1
+            fi
+            
+            echo "${PROTOCOL}_URL=$TUNNEL_URL" >> $GITHUB_ENV
+            
+            echo "CONNECTION_IP=$TUNNEL_URL" >> $GITHUB_ENV
+            echo "$PROTOCOL (Ngrok): $TUNNEL_URL"
+            
+          elif [ "$METHOD" = "bore" ]; then
+            echo "Starting Bore tunnel for $PROTOCOL (Port $PORT)..."
+            nohup bore local $PORT --to bore.pub > bore_log.log 2>&1 &
+            sleep 5
+            
+            TUNNEL_INFO=$(grep "listening at bore.pub" bore_log.log | tail -n 1)
+            TUNNEL_IP=$(echo "$TUNNEL_INFO" | grep -Eo 'bore.pub:[0-9]+') 
+            
+            if [ -z "$TUNNEL_IP" ]; then
+                echo "::error::Failed to get Bore public address. Attempting to kill bore process."
+                sudo pkill -f 'bore local' || true 
+                exit 1
+            fi
+            
+            echo "${PROTOCOL}_URL=$TUNNEL_IP" >> $GITHUB_ENV
+            echo "CONNECTION_IP=$TUNNEL_IP" >> $GITHUB_ENV
+            echo "$PROTOCOL (Bore): $TUNNEL_IP"
+          fi
+
+      - name: Connection Information and Keep Alive
+        run: |
+          echo "Thanks to MR.English2008 for this perfect work"
+          echo
+          echo "=== CONNECTION INFORMATION ==="
+          echo "RDP Username: ${USERNAME}"
+          echo "RDP Password: ${PASSWORD}"
+          echo
+          echo "Connection Type: ${{ env.CONNECTION_TYPE }}"
+          echo "Program Selected: ${{ github.event.inputs.connection_program }}"
+          echo
+          
+          CONNECTION_TYPE="${{ env.CONNECTION_TYPE }}"
+          CONNECTION_IP="${{ env.CONNECTION_IP }}"
+          PROGRAM="${{ github.event.inputs.connection_program }}"
+
+          if [ "$CONNECTION_TYPE" = "Tailscale" ]; then
+            echo "Tailscale IP:"
+            sudo tailscale ip -4 || true
+            echo
+            echo ">>> RDP Connection: $CONNECTION_IP:3389"
+            echo ">>> VNC Connection: $CONNECTION_IP:5900"
+            echo ">>> NoMachine Connection: $CONNECTION_IP:4000"
+          
+          elif [ "$CONNECTION_TYPE" = "Ngrok" ]; then
+            echo ">>> $PROGRAM (Ngrok): $CONNECTION_IP"
+            
+          elif [ "$CONNECTION_TYPE" = "Bore" ]; then
+            echo ">>> $PROGRAM (Bore): $CONNECTION_IP"
+            
+          else
+            echo "Connection failed or connection method not selected."
+          fi
+
+          PROGRAM_NAME="${{ github.event.inputs.connection_program }}"
+          if [ "$PROGRAM_NAME" = "RustDesk" ]; then
+            echo ">>> RustDesk ID: ${{ env.RUSTDESK_ID }}"
+          fi
+          if [ "$PROGRAM_NAME" = "AnyDesk" ]; then
+            echo ">>> AnyDesk ID: ${{ env.ANYDESK_ID }}"
+          fi
+          
+          echo
+          echo "NOTE: if you connect with RDP or VNC you have to click on Connect_VNC.sh to open the qemu VM"  
+          echo  
+          echo "NOTE: if you did connect with RDP or NoMachine and open Connect_VNC.sh you will not be able to connect to VNC unless you disconnect from RDP or NoMachine"  
+          echo  
+          echo "NOTE: to disconnect type F8 from client keyboard a menu will appear click on Disconnect then you will be able to connect with VNC viewer again"  
+          echo   
+          echo "Have fun"
+          
+          RUNTIME="${{ github.event.inputs.runtime }}"
+          UPLOAD_QCOW2="${{ github.event.inputs.upload_qcow2 }}"
+          VM="${{ github.event.inputs.vm_name }}"
+          MNT_PATH="/mnt"
+
+          echo "Keeping the session alive for ${RUNTIME} minutes..."
+          if [[ "$UPLOAD_QCOW2" == "yes" && "$RUNTIME" -gt 325 ]]; then
+              RUNTIME=325
+          fi
+          sleep $((RUNTIME * 60))
+          echo "Session ended after ${RUNTIME} minutes."
+          
+      - name: Compressing and uploading the disk image
+        if: always()
+        run: |
+          UPLOAD_QCOW2="${{ github.event.inputs.upload_qcow2 }}"
+          VM="${{ github.event.inputs.vm_name }}"
+          DISK_FORMAT="${{ env.DISK_FORMAT }}"
+          if [ -z "$DISK_FORMAT" ]; then
+            DISK_FORMAT="qcow2"
+          fi
+          if [ "$DISK_FORMAT" = "raw" ]; then
+            DISK_FILE="/mnt/${VM}.img"
+          else
+            DISK_FILE="/mnt/${VM}.qcow2"
+          fi
+
+          sudo pkill -9 qemu || true
+          if [[ "$UPLOAD_QCOW2" == "yes" ]]; then
+ 
+            DATE=$(date +%d-%m-%Y)
+            echo "Compressing disk image to 7z..."
+            sudo 7z a -t7z -mx=9 "/mnt/${VM}-${DATE}.7z" "$DISK_FILE"
+      
+            echo "Starting upload using MegaTools..."
+            TARGET_FILE="${VM}-${DATE}.7z"
+            TARGET_PATH="/mnt/$TARGET_FILE"
+            
+            echo "Setting up MegaTools configuration file..."
+            touch .megarc
+            echo "[Login]" > .megarc
+            echo "Username = $MEGA_EMAIL" >> .megarc
+            echo "Password = $MEGA_PASSWORD" >> .megarc
+            echo "MEGA.email = $MEGA_EMAIL"
+            echo "MEGA.Password = $MEGA_PASSWORD"
+            megals > /dev/null 2>&1
+            echo " list /mnt files "
+            ls -lh /mnt | grep -E '\.7z$|\.qcow2$|\.img$|\.iso$' | awk '{split($5,size,""); if($5 ~ /G/){print $9, $5} else {printf "%s %.2fG\n", $9, $5/1024/1024/1024}}'
+            sudo cp .megarc /mnt
+            echo " uploading disk image to mega"
+            sudo megaput "/mnt/${VM}-${DATE}.7z" --path /Root
+            echo "getting the download link"
+            DOWNLOAD_LINK=$(sudo megaexport /Root/"${VM}-${DATE}.7z")
+            echo "Download link: $DOWNLOAD_LINK"
+          else
+            echo "Skipped uploading Compressed disk image."
+          fi
