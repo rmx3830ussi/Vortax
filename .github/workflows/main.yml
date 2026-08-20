@@ -65,6 +65,32 @@
 #   the connection), so an empty input no longer means "skip
 #   auth" for them — it means "generate one for this run."
 #
+# - Added: legacy_profile input (none, winnt4, winme, win2000),
+#   sourced from the Computernewb QEMU install guides for each.
+#   Forces BIOS mode (these predate UEFI), swaps in the correct
+#   CPU model, VGA device, NIC model, RAM, and disk size, and
+#   drops virtio/USB devices these guests have no drivers for.
+#   Windows Me specifically runs without KVM (-accel kvm is
+#   skipped) since the guide reports frequent lockups/BSODs
+#   under KVM on Me — NT4 and Win2000 do use KVM.
+#   Caveat: smp is left at the global default (2) — these are
+#   uniprocessor-era OSes; if boot is flaky, try extra_qemu_args
+#   or lower it and open an issue so we can wire a per-profile
+#   override.
+#
+# - Fixed: real bug found on a live run — Batocera's .img.gz
+#   download crashed with an unzip error. Root cause: file
+#   --mime-type reports .gz as "application/gzip", and the old
+#   chained `[[ ... == *"zip"* ]]` check ran BEFORE the gzip
+#   check — "gzip" contains the literal substring "zip", so
+#   every .gz file matched the zip branch first and got handed
+#   to `unzip`, which can't open it. Replaced the whole file-
+#   type dispatch with a `case` statement (stops at first match,
+#   ordered gzip-before-zip, no more silent substring collision)
+#   and factored the repeated post-extraction disk-detection
+#   logic into a `handle_extracted_disk` function instead of
+#   duplicating it once per archive type.
+#
 # KNOWN ISSUES (not fixed yet, flagging so we don't lose them)
 # - MEGA_EMAIL / MEGA_PASSWORD are referenced in the final
 #   upload step but never defined from secrets.* anywhere in
@@ -132,6 +158,14 @@ on:
         default: ''
       remote_access_password:
         description: 'Optional dedicated password for RustDesk/AnyDesk unattended access. Falls back to vnc_password if blank, or to an auto-generated one-time password (printed in this run''s log) if both are blank — unattended access needs a real password on a headless box.'
+        required: false
+        default: ''
+      legacy_profile:
+        description: 'Old-OS hardware preset (none, winnt4, winme, win2000, win98, win95, win31, win1x, win2x). Overrides CPU/VGA/network/RAM to period-accurate values and forces BIOS mode. win95/win31/win1x/win2x install from floppy — see legacy_floppy_url.'
+        required: false
+        default: 'none'
+      legacy_floppy_url:
+        description: 'URL to a floppy (.ima) image for win95/win31/win1x/win2x — patcher9x boot floppy for win95, DOS/Windows install floppy for the rest. Bring your own legally-obtained copy; none is bundled.'
         required: false
         default: ''
 
@@ -480,36 +514,11 @@ jobs:
 
           EXT=$(file -b --mime-type "$FILE_PATH")
 
-          if [[ "$EXT" == *"iso"* ]]; then
-            # Installer media — move as .iso and create a blank target
-            # disk for it to install onto.
-            sudo mv "$FILE_PATH" "$HOME_PATH/${VM}.iso"
-            sudo qemu-img create -f qcow2 "$MNT_PATH/${VM}.qcow2" "${DISK}G"
-            echo "DISK_FORMAT=qcow2" >> $GITHUB_ENV
-
-          elif [[ "$EXT" == *"zip"* || "$EXT" == *"7z"* || "$EXT" == *"rar"* || "$EXT" == *"tar"* || "$EXT" == *"gzip"* ]]; then
-            cd "$TEMP_PATH"
-            if [[ "$EXT" == *"zip"* ]]; then
-              sudo unzip -q "$FILE_PATH" -d "$TEMP_PATH"
-            elif [[ "$EXT" == *"7z"* ]]; then
-              sudo 7z x -y "$FILE_PATH" > /dev/null
-            elif [[ "$EXT" == *"rar"* ]]; then
-              sudo unrar x -inul "$FILE_PATH"
-            elif [[ "$EXT" == *"gzip"* ]]; then
-              # A .gz can be a tar.gz archive OR a single compressed
-              # file (e.g. Batocera's *.img.gz). tar -xf fails on the
-              # latter, so test with tar -tzf before deciding.
-              if tar -tzf "$FILE_PATH" >/dev/null 2>&1; then
-                echo "Detected tar.gz archive, extracting with tar..."
-                sudo tar -xzf "$FILE_PATH"
-              else
-                echo "Detected plain .gz (single file), extracting with gunzip..."
-                sudo gunzip -c "$FILE_PATH" > "$TEMP_PATH/${VM}_extracted.img"
-              fi
-            else
-              sudo tar -xf "$FILE_PATH"
-            fi
-
+          # Shared post-extraction handling: look for a disk image
+          # inside whatever archive we just extracted, detect its
+          # real format, and convert/rename accordingly. Called from
+          # every archive branch below instead of duplicated 5 times.
+          handle_extracted_disk() {
             FOUND=$(find "$TEMP_PATH" -type f \( -iname "*.qcow2" -o -iname "*.img" -o -iname "*.raw" \) | head -n 1)
             if [ -n "$FOUND" ]; then
               REAL_FORMAT=$(sudo qemu-img info --output=json "$FOUND" | jq -r '.format')
@@ -538,35 +547,102 @@ jobs:
                 if [ -n "$ARCHIVE_FOUND" ]; then
                     mkdir -p "$TEMP_PATH/unpack"
                     EXT2=$(file -b --mime-type "$ARCHIVE_FOUND")
-                    if [[ "$EXT2" == *"zip"* ]]; then
+                    case "$EXT2" in
+                      *"zip"*)
                         unzip -q "$ARCHIVE_FOUND" -d "$TEMP_PATH/unpack"
-                    elif [[ "$EXT2" == *"7z"* ]]; then
+                        ;;
+                      *"7z"*)
                         7z x "$ARCHIVE_FOUND" -o"$TEMP_PATH/unpack" > /dev/null
-                    else
+                        ;;
+                      *)
                         tar -xf "$ARCHIVE_FOUND" -C "$TEMP_PATH/unpack"
-                    fi
+                        ;;
+                    esac
                     mkisofs -o "$HOME_PATH/${VM}.iso" -b boot/isolinux/isolinux.bin -c boot/isolinux/boot.cat -no-emul-boot -boot-load-size 4 -boot-info-table -J -R "$TEMP_PATH/unpack"
                     rm -rf "$TEMP_PATH/unpack"
                     echo "DISK_FORMAT=qcow2" >> $GITHUB_ENV
+                else
+                  echo "::warning::No disk image or installer archive found inside the extracted contents of $FILE_PATH."
                 fi
               fi
             fi
+          }
 
-          else
-            # Not recognized as iso/zip/7z/rar/tar/gzip — check if the
-            # downloaded file is already a raw or qcow2 disk image
-            # itself (e.g. a direct, uncompressed .img download).
-            REAL_FORMAT=$(sudo qemu-img info --output=json "$FILE_PATH" 2>/dev/null | jq -r '.format' 2>/dev/null)
-            if [ "$REAL_FORMAT" = "qcow2" ]; then
-              sudo mv "$FILE_PATH" "$MNT_PATH/${VM}.qcow2"
+          # ------------------------------------------------------------
+          # Dispatch by detected file type. This is a `case`, not a
+          # chain of `[[ ... == *pattern* ]]` checks, on purpose:
+          # `file --mime-type` reports .gz files as "application/gzip",
+          # and "gzip" contains the literal substring "zip" — a
+          # wildcard zip check placed before the gzip check will match
+          # gzip files too and hand them to `unzip`, which is exactly
+          # what broke Batocera's .img.gz download previously. `case`
+          # stops at the first match, so ordering here is what matters:
+          # gzip is listed before zip and there's no ambiguity.
+          # ------------------------------------------------------------
+          case "$EXT" in
+            *"iso"*)
+              # Installer media — move as .iso and create a blank
+              # target disk for it to install onto.
+              sudo mv "$FILE_PATH" "$HOME_PATH/${VM}.iso"
+              sudo qemu-img create -f qcow2 "$MNT_PATH/${VM}.qcow2" "${DISK}G"
               echo "DISK_FORMAT=qcow2" >> $GITHUB_ENV
-            elif [ -n "$REAL_FORMAT" ] && [ "$REAL_FORMAT" != "null" ]; then
-              sudo mv "$FILE_PATH" "$MNT_PATH/${VM}.img"
-              echo "DISK_FORMAT=$REAL_FORMAT" >> $GITHUB_ENV
-            else
-              echo "::warning::Could not determine file type for $FILE_PATH — leaving as-is at $FILE_PATH."
-            fi
-          fi
+              ;;
+
+            *"gzip"*)
+              # A .gz can be a tar.gz archive OR a single compressed
+              # file (e.g. Batocera's *.img.gz). tar -xf fails on the
+              # latter, so test with tar -tzf before deciding.
+              cd "$TEMP_PATH"
+              if tar -tzf "$FILE_PATH" >/dev/null 2>&1; then
+                echo "Detected tar.gz archive, extracting with tar..."
+                sudo tar -xzf "$FILE_PATH"
+              else
+                echo "Detected plain .gz (single file), extracting with gunzip..."
+                sudo gunzip -c "$FILE_PATH" > "$TEMP_PATH/${VM}_extracted.img"
+              fi
+              handle_extracted_disk
+              ;;
+
+            *"zip"*)
+              cd "$TEMP_PATH"
+              sudo unzip -q "$FILE_PATH" -d "$TEMP_PATH"
+              handle_extracted_disk
+              ;;
+
+            *"7z"*)
+              cd "$TEMP_PATH"
+              sudo 7z x -y "$FILE_PATH" > /dev/null
+              handle_extracted_disk
+              ;;
+
+            *"rar"*)
+              cd "$TEMP_PATH"
+              sudo unrar x -inul "$FILE_PATH"
+              handle_extracted_disk
+              ;;
+
+            *"tar"*)
+              cd "$TEMP_PATH"
+              sudo tar -xf "$FILE_PATH"
+              handle_extracted_disk
+              ;;
+
+            *)
+              # Not recognized as iso/archive — check if the downloaded
+              # file is already a raw or qcow2 disk image itself (e.g.
+              # a direct, uncompressed .img download).
+              REAL_FORMAT=$(sudo qemu-img info --output=json "$FILE_PATH" 2>/dev/null | jq -r '.format' 2>/dev/null)
+              if [ "$REAL_FORMAT" = "qcow2" ]; then
+                sudo mv "$FILE_PATH" "$MNT_PATH/${VM}.qcow2"
+                echo "DISK_FORMAT=qcow2" >> $GITHUB_ENV
+              elif [ -n "$REAL_FORMAT" ] && [ "$REAL_FORMAT" != "null" ]; then
+                sudo mv "$FILE_PATH" "$MNT_PATH/${VM}.img"
+                echo "DISK_FORMAT=$REAL_FORMAT" >> $GITHUB_ENV
+              else
+                echo "::warning::Could not determine file type for $FILE_PATH (detected as: $EXT) — leaving as-is at $FILE_PATH."
+              fi
+              ;;
+          esac
 
           sudo rm -rf "$TEMP_PATH"
 
@@ -616,6 +692,144 @@ jobs:
             VNC_OPT=":0"
           fi
 
+          # ------------------------------------------------------------
+          # Legacy OS hardware presets, sourced from the Computernewb
+          # QEMU install guides for each specific system. These are NOT
+          # arbitrary choices — old guests break on modern defaults:
+          #   - virtio has no drivers on any of these OSes
+          #   - UEFI didn't exist yet for anything on this list
+          #   - newer CPU models trigger a setup BSOD on NT4 and Win98
+          #   - Windows Me is explicitly unstable under KVM
+          #   - Win95/Win3.1/Win1.x/Win2.x install from FLOPPY, not CD —
+          #     these need legacy_floppy_url or they can't boot at all
+          # ------------------------------------------------------------
+          LEGACY_PROFILE="${{ github.event.inputs.legacy_profile }}"
+          LEGACY_FLOPPY_URL="${{ github.event.inputs.legacy_floppy_url }}"
+          LEGACY_ENABLE_KVM="yes"
+          LEGACY_RTC="-rtc base=localtime"
+          LEGACY_CPU=""
+          LEGACY_MACHINE=""
+          LEGACY_NET_MODEL="pcnet"
+          LEGACY_EXTRA_DEVICES=()
+          LEGACY_BOOT_MEDIUM="cdrom"   # cdrom | floppy
+
+          case "$LEGACY_PROFILE" in
+            winnt4)
+              LEGACY_CPU="pentium3"
+              LEGACY_MACHINE="pc,hpet=off"
+              LEGACY_VGA_ARGS=(-device VGA)
+              LEGACY_NET_MODEL="pcnet"
+              LEGACY_RAM_MB="128"
+              LEGACY_DISK_SIZE="4G"
+              # NT4 setup can't format a partition bigger than 4GB —
+              # capped here; use gparted afterward if you need more.
+              ;;
+            winme)
+              LEGACY_CPU="pentium3"
+              LEGACY_VGA_ARGS=(-vga cirrus)
+              LEGACY_NET_MODEL="pcnet"
+              LEGACY_RAM_MB="128"
+              LEGACY_DISK_SIZE="2G"
+              LEGACY_ENABLE_KVM="no"
+              # Guide is explicit: Me is highly unstable under KVM,
+              # frequent lockups/BSODs — run TCG (software) instead.
+              ;;
+            win2000)
+              LEGACY_CPU="host"
+              LEGACY_VGA_ARGS=(-vga cirrus)
+              LEGACY_NET_MODEL="pcnet"
+              LEGACY_RAM_MB="256"
+              LEGACY_DISK_SIZE="10G"
+              ;;
+            win98)
+              LEGACY_CPU="host"
+              LEGACY_MACHINE="pc,hpet=off,acpi=on,usb=on,accel=kvm"
+              LEGACY_VGA_ARGS=(-device "VGA,vgamem_mb=64")
+              LEGACY_NET_MODEL="rtl8139"
+              LEGACY_RAM_MB="256"
+              LEGACY_DISK_SIZE="4G"
+              LEGACY_EXTRA_DEVICES=(-device usb-tablet)
+              # accel=kvm is already inside -M above, so the generic
+              # "-accel kvm" append below is skipped for this profile
+              # to avoid passing it twice.
+              # Guide's troubleshooting note: a VXD/protection BSOD on
+              # first boot means this CPU model doesn't agree with
+              # Win98 — override via extra_qemu_args with -cpu
+              # core2duo (Intel host) or -cpu Opteron_G2 (AMD host).
+              ;;
+            win95)
+              LEGACY_CPU=""
+              LEGACY_VGA_ARGS=(-device "cirrus-vga,vgamem_mb=16")
+              LEGACY_NET_MODEL="pcnet"
+              LEGACY_RAM_MB=""
+              LEGACY_DISK_SIZE="700M"
+              LEGACY_BOOT_MEDIUM="floppy"
+              # Guide's command has no explicit -m — QEMU's own default
+              # applies unless you set one via extra_qemu_args.
+              # Needs the patcher9x boot floppy just to install/boot
+              # under KVM at all (JHRobotics/patcher9x on GitHub) —
+              # provide it via legacy_floppy_url. The actual multi-part
+              # install (fdisk, copy, patch9x -auto, reboot to boot
+              # disk, lock C:, setup /is) is done by hand over VNC,
+              # same as every other profile here — this only wires up
+              # correct hardware and boot order.
+              ;;
+            win31)
+              LEGACY_CPU="486"
+              LEGACY_VGA_ARGS=(-vga vmware)
+              LEGACY_NET_MODEL="rtl8139"
+              LEGACY_RAM_MB="16"
+              LEGACY_DISK_SIZE="150M"
+              LEGACY_EXTRA_DEVICES=(-usb -device usb-tablet -device sb16)
+              LEGACY_BOOT_MEDIUM="floppy"
+              LEGACY_ENABLE_KVM="no"
+              # Guide's command has no -accel/-enable-kvm at all —
+              # matched exactly rather than assuming it wants one.
+              # Installs entirely from DOS + floppies per the guide, no
+              # CD involved — provide the DOS boot floppy via
+              # legacy_floppy_url.
+              ;;
+            win1x|win2x)
+              LEGACY_CPU=""
+              LEGACY_VGA_ARGS=(-vga std)
+              LEGACY_NET_MODEL="none"
+              LEGACY_RAM_MB="1"
+              LEGACY_DISK_SIZE="32M"
+              LEGACY_BOOT_MEDIUM="floppy"
+              # DOS-hosted, installs from a single floppy — provide it
+              # via legacy_floppy_url. win1x guide uses -net none
+              # entirely; win2x's guide is nearly identical.
+              ;;
+            none|"")
+              LEGACY_PROFILE="none"
+              ;;
+            *)
+              echo "::warning::Unknown legacy_profile '$LEGACY_PROFILE' — ignoring, running with modern defaults."
+              LEGACY_PROFILE="none"
+              ;;
+          esac
+
+          if [ "$LEGACY_PROFILE" != "none" ] && [ "$BIOS_MODE" = "UEFI" ]; then
+            echo "::warning::$LEGACY_PROFILE predates UEFI — forcing BIOS mode for this run."
+            BIOS_MODE="BIOS"
+          fi
+
+          # Floppy download — only for profiles that need one. We don't
+          # hardcode a source for DOS/Windows 1.x/2.x/3.1 install media
+          # (still Microsoft's copyrighted software); point
+          # legacy_floppy_url at your own legally-obtained copy.
+          LEGACY_FLOPPY_PATH=""
+          if [ "$LEGACY_PROFILE" != "none" ] && [ -n "$LEGACY_FLOPPY_URL" ]; then
+            LEGACY_FLOPPY_PATH="$HOME_PATH/legacy_floppy.ima"
+            echo "Downloading floppy image for $LEGACY_PROFILE..."
+            sudo wget -q -O "$LEGACY_FLOPPY_PATH" "$LEGACY_FLOPPY_URL" || echo "::warning::Failed to download legacy_floppy_url"
+          fi
+
+          if [ "$LEGACY_PROFILE" != "none" ] && [ "$LEGACY_BOOT_MEDIUM" = "floppy" ] && [ -z "$LEGACY_FLOPPY_PATH" ]; then
+            echo "::warning::$LEGACY_PROFILE normally boots/installs from a floppy (legacy_floppy_url) — none provided, falling back to cdrom/hdd boot. Per the wiki guide this profile likely will not install correctly without it."
+            LEGACY_BOOT_MEDIUM="cdrom"
+          fi
+
           # OVMF firmware is only needed for UEFI boots — no reason to
           # fetch it on every BIOS run.
           if [ "$BIOS_MODE" = "UEFI" ]; then
@@ -627,7 +841,12 @@ jobs:
           fi
 
           if [ ! -f "$DISK_PATH" ]; then
-            sudo qemu-img create -f "$DISK_FORMAT" "$DISK_PATH" "${DISK}G" || true
+            EFFECTIVE_DISK_SIZE="${DISK}G"
+            if [ "$LEGACY_PROFILE" != "none" ]; then
+              EFFECTIVE_DISK_SIZE="$LEGACY_DISK_SIZE"
+              echo "Legacy profile $LEGACY_PROFILE: creating a $EFFECTIVE_DISK_SIZE disk (period-appropriate size)."
+            fi
+            sudo qemu-img create -f "$DISK_FORMAT" "$DISK_PATH" "$EFFECTIVE_DISK_SIZE" || true
           fi
 
           # ------------------------------------------------------------
@@ -637,22 +856,65 @@ jobs:
           # joystick passthrough, sound, etc.), append to QEMU_ARGS
           # here instead of copy-pasting a whole new block.
           # ------------------------------------------------------------
+          if [ "$LEGACY_PROFILE" != "none" ]; then
+            EFFECTIVE_CPU="$LEGACY_CPU"
+            EFFECTIVE_MEM="${LEGACY_RAM_MB:-}"
+            EFFECTIVE_NET_DEVICE="${LEGACY_NET_MODEL}"
+          else
+            EFFECTIVE_CPU="host"
+            EFFECTIVE_MEM="${RAM}G"
+            EFFECTIVE_NET_DEVICE="${NETWORK_CARD}"
+          fi
+
           QEMU_ARGS=(
-            -enable-kvm
-            -cpu host
             -smp "${VCPUS}"
-            -m "${RAM}G"
             -vnc "${VNC_OPT}"
             -monitor tcp:localhost:4444,server,nowait
             -display none
-            -netdev user,id=net0
-            -device "${NETWORK_CARD},netdev=net0"
-            -device usb-ehci,id=ehci
-            -device usb-tablet,bus=ehci.0
-            -drive file=/mnt/virtio-win.iso,media=cdrom,if=none,id=cd1
-            -device ide-cd,bus=ide.1,drive=cd1
             -name "${VM}"
           )
+
+          if [ -n "$EFFECTIVE_CPU" ]; then
+            QEMU_ARGS+=(-cpu "$EFFECTIVE_CPU")
+          fi
+
+          if [ -n "$EFFECTIVE_MEM" ]; then
+            QEMU_ARGS+=(-m "$EFFECTIVE_MEM")
+          fi
+
+          if [ "$LEGACY_PROFILE" != "none" ]; then
+            if [ "$LEGACY_ENABLE_KVM" = "yes" ] && [[ "$LEGACY_MACHINE" != *"accel="* ]]; then
+              QEMU_ARGS+=(-accel kvm)
+            fi
+            if [ -n "$LEGACY_MACHINE" ]; then
+              QEMU_ARGS+=(-M "${LEGACY_MACHINE}")
+            fi
+            QEMU_ARGS+=("${LEGACY_VGA_ARGS[@]}")
+            QEMU_ARGS+=(${LEGACY_RTC})
+            if [ "$LEGACY_NET_MODEL" = "none" ]; then
+              QEMU_ARGS+=(-net none)
+            else
+              QEMU_ARGS+=(-netdev user,id=net0 -device "${EFFECTIVE_NET_DEVICE},netdev=net0")
+            fi
+            if [ ${#LEGACY_EXTRA_DEVICES[@]} -gt 0 ]; then
+              QEMU_ARGS+=("${LEGACY_EXTRA_DEVICES[@]}")
+            fi
+            if [ -n "$LEGACY_FLOPPY_PATH" ]; then
+              QEMU_ARGS+=(-fda "$LEGACY_FLOPPY_PATH")
+            fi
+            # No virtio-win ISO, no virtio-era USB controller — none of
+            # that exists as a driver option on these guests.
+          else
+            QEMU_ARGS+=(
+              -enable-kvm
+              -netdev user,id=net0
+              -device "${EFFECTIVE_NET_DEVICE},netdev=net0"
+              -device usb-ehci,id=ehci
+              -device usb-tablet,bus=ehci.0
+              -drive file=/mnt/virtio-win.iso,media=cdrom,if=none,id=cd1
+              -device ide-cd,bus=ide.1,drive=cd1
+            )
+          fi
 
           if [ "$BIOS_MODE" = "UEFI" ]; then
             QEMU_ARGS+=(
@@ -661,7 +923,12 @@ jobs:
             )
           fi
 
-          if [ -f "$ISO_PATH" ]; then
+          if [ "$LEGACY_PROFILE" != "none" ] && [ "$LEGACY_BOOT_MEDIUM" = "floppy" ] && [ -n "$LEGACY_FLOPPY_PATH" ]; then
+            QEMU_ARGS+=(-boot a)
+            if [ -f "$ISO_PATH" ]; then
+              QEMU_ARGS+=(-cdrom "$ISO_PATH")
+            fi
+          elif [ -f "$ISO_PATH" ]; then
             QEMU_ARGS+=(-boot d -cdrom "$ISO_PATH")
           else
             QEMU_ARGS+=(-boot c)
@@ -670,6 +937,9 @@ jobs:
           if [ "$BIOS_MODE" = "UEFI" ] && [ -f "$ISO_PATH" ]; then
             # Matches the original UEFI+installer config: boot disk
             # goes through virtio-blk-pci rather than plain -hda.
+            # (Legacy profiles never reach here — BIOS mode is forced
+            # above, so they always fall through to plain -hda below,
+            # matching the NT4/Me/2000 guides exactly.)
             QEMU_ARGS+=(
               -drive "if=none,id=hd0,file=${DISK_PATH},format=${DISK_FORMAT}"
               -device virtio-blk-pci,drive=hd0
