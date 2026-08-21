@@ -1,0 +1,137 @@
+name: Setup XFCE Runner + Sunshine + Tailscale
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  setup-gui-runner:
+    runs-on: ubuntu-latest
+    env:
+      TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+      SSH_PUBLIC_KEY: ${{ secrets.SSH_PUBLIC_KEY }}   # optional but recommended - see notes below
+      USERNAME: runner
+      PASSWORD: runner
+      TAILSCALE_HOSTNAME: gh-xfce-${{ github.run_id }}
+      DISPLAY: ":1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Ensure runner user has sudo + lingering session
+        run: |
+          echo "${USERNAME}:${PASSWORD}" | sudo chpasswd
+          echo "${USERNAME} ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/${USERNAME}
+          sudo loginctl enable-linger ${USERNAME}
+
+      - name: Install XFCE + virtual display + SSH (clean install)
+        run: |
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
+            xfce4 xfce4-goodies xorg dbus-x11 xvfb x11-xserver-utils miniupnpc openssh-server
+          # keep the runner image lean and apt output quiet
+          sudo apt-get clean
+          sudo rm -rf /var/lib/apt/lists/*
+
+      - name: Configure SSH (reachable over Tailscale, no inbound ports needed)
+        run: |
+          sudo mkdir -p /home/${USERNAME}/.ssh
+          if [ -n "${SSH_PUBLIC_KEY}" ]; then
+            echo "${SSH_PUBLIC_KEY}" | sudo tee /home/${USERNAME}/.ssh/authorized_keys > /dev/null
+            sudo chmod 700 /home/${USERNAME}/.ssh
+            sudo chmod 600 /home/${USERNAME}/.ssh/authorized_keys
+            sudo chown -R ${USERNAME}:${USERNAME} /home/${USERNAME}/.ssh
+            echo "Key-based auth configured."
+          else
+            echo "No SSH_PUBLIC_KEY secret set - falling back to password auth (less secure, fine for a throwaway runner)."
+          fi
+          sudo sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
+          sudo sed -i 's/^#\?PubkeyAuthentication.*/PubkeyAuthentication yes/' /etc/ssh/sshd_config
+          sudo systemctl restart ssh || sudo service ssh restart
+
+      - name: Start virtual display + XFCE session
+        run: |
+          Xvfb :1 -screen 0 1920x1080x24 &
+          sleep 2
+          DISPLAY=:1 startxfce4 &
+          sleep 3
+
+      - name: Install Tailscale
+        run: |
+          curl -fsSL https://tailscale.com/install.sh | sudo sh
+          sudo tailscale up --authkey "${TAILSCALE_AUTHKEY}" --hostname "${TAILSCALE_HOSTNAME}"
+          TS_IP=$(sudo tailscale ip -4)
+          echo "TS_IP=${TS_IP}" >> "$GITHUB_ENV"
+          echo "CSRF_ORIGIN=https://${TS_IP}:47990" >> "$GITHUB_ENV"
+
+      - name: Setup Sunshine (clean install)
+        run: |
+          curl -fsSL -o sunshine.deb https://github.com/LizardByte/Sunshine/releases/download/v2026.516.143833/sunshine-ubuntu-24.04-amd64.deb
+          sudo dpkg -i sunshine.deb
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -f -y -qq --no-install-recommends
+          sudo apt-get clean
+          sudo rm -rf /var/lib/apt/lists/*
+
+          sunshine --creds "${USERNAME}" "${PASSWORD}"
+          echo 'KERNEL=="uinput", SUBSYSTEM=="misc", OPTIONS+="static_node=uinput", TAG+="uaccess"' | \
+            sudo tee /etc/udev/rules.d/60-sunshine.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger
+
+          echo "=== confirming Xvfb/XFCE are still alive ==="
+          pgrep -af Xvfb || echo "Xvfb is NOT running!"
+          pgrep -af xfce4-session || echo "xfce4-session is NOT running!"
+
+          mkdir -p ~/.config/sunshine
+          cat >> ~/.config/sunshine/sunshine.conf <<EOF
+          csrf_allowed_origins = ${CSRF_ORIGIN}
+          min_log_level = debug
+          EOF
+          echo "=== sunshine.conf ==="
+          cat ~/.config/sunshine/sunshine.conf
+
+          # log to a fixed path in the workspace so it survives to the upload step
+          DISPLAY=:1 stdbuf -oL -eL nohup sunshine > "$GITHUB_WORKSPACE/sunshine.log" 2>&1 &
+          echo "Sunshine PID: $!"
+
+          echo "=== waiting for sunshine to bind 47990 ==="
+          for i in $(seq 1 30); do
+            if sudo ss -tlnp | grep -q 47990; then
+              echo "Sunshine is up after ${i}s"
+              break
+            fi
+            sleep 1
+          done
+
+          echo "=== is sunshine still alive? ==="
+          pgrep -af sunshine || echo "sunshine process died!"
+          echo "=== all sunshine ports ==="
+          sudo ss -tlnp | grep -E '47984|47989|47990|48010' || echo "none of 47984/47989/47990/48010 bound"
+          sudo ss -ulnp | grep -E '47998|47999|48000|48002' || echo "none of 47998/47999/48000/48002 bound"
+
+      - name: Connection Info
+        run: |
+          echo "=== FINAL CONNECTION INFO ==="
+          echo "Sunshine web UI: https://${TS_IP}:47990"
+          echo "Sunshine login:  ${USERNAME} / ${PASSWORD}"
+          echo "SSH (debug):     ssh ${USERNAME}@${TS_IP}"
+          echo ">>> Add this PC as a host in Moonlight using the Tailscale IP above."
+
+      # This step runs live while you SSH in and poke around.
+      # tail -f is backgrounded so this step doesn't block Connection Info
+      # or the later log upload from being reached on cancel.
+      - name: Keep alive (stream sunshine.log to the Actions console)
+        run: |
+          tail -f "$GITHUB_WORKSPACE/sunshine.log" &
+          while true; do sleep 600; done
+
+      # Runs even when you cancel the workflow from the Actions UI,
+      # so you get the full log afterward instead of only what scrolled by live.
+      - name: Upload debug logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sunshine-debug-logs-${{ github.run_id }}
+          path: |
+            sunshine.log
+            ~/.config/sunshine/sunshine.conf
+          if-no-files-found: warn
+          retention-days: 7
