@@ -2,14 +2,33 @@
 # CHANGELOG (manual — keep this updated as you iterate)
 #
 # V1.0
-# - Set fixed defaults for host_package_url/image_zip_url (build
-#   16102939), so it works out of the box without typing URLs in
-#   every run. Both inputs are still overridable — when this
-#   build eventually gets pruned from ci.android.com (they don't
-#   retain artifacts indefinitely) and starts 404ing, grab a new
-#   pair from the same build ID at
-#   https://ci.android.com/builds/branches/aosp-main/grid?legacy=1
-#   and update the defaults, or just override per-run.
+# - Added: automatic resolution of ci.android.com build-page URLs
+#   to their real storage.googleapis.com signed download link.
+#   Those page URLs serve a small HTML "Artifact Viewer" page,
+#   not the file — but that page embeds the currently-valid
+#   signed URL as a JS variable (JSVariables.artifactUrl). A
+#   cheap Range request (first 8KB only, capped at 1MB even if a
+#   server ever ignores Range) peeks at the response; if it's
+#   that landing page, the real URL gets extracted and used
+#   instead. Both host_package_url and image_zip_url now accept
+#   either kind of link.
+# - Fixed: a real run failed with a cryptic "gzip: stdin: not in
+#   gzip format" / "tar: Child returned status 1" — the actual
+#   cause was ci.android.com's build-page URL returning an HTML
+#   landing page instead of the file itself (aria2/wget/curl all
+#   "succeed" downloading it, since it's a valid 200 response,
+#   just not the content you wanted). Added a file-type check
+#   right after each download, before extraction ever runs, that
+#   fails immediately with a clear message pointing at the actual
+#   cause instead of a confusing tar/gzip error three steps later.
+# - Reverted host_package_url/image_zip_url to empty/required —
+#   briefly set fixed defaults pointing at a ci.android.com build
+#   page, but the *actual* working links are storage.googleapis.com
+#   signed URLs that expire within hours of being generated (one
+#   decoded to literally the same minute it was grabbed) — there's
+#   no such thing as a "fixed default" for this resource. Grab a
+#   fresh signed URL each run by clicking the filename in an actual
+#   browser, not the ci.android.com page URL.
 # - Initial version. Native install (cuttlefish-base/user/
 #   orchestration via apt), no Docker — matches your preference
 #   for using the actual tooling directly rather than wrapping it.
@@ -36,19 +55,19 @@
 #   cover shell redirects into a root-owned dir" bug class.
 # ============================================================
 
-name: Android-Cuttlefish
+name: Android-Cuttlefish new
 
 on:
   workflow_dispatch:
     inputs:
       host_package_url:
-        description: 'URL to cvd-host_package.tar.gz. Defaults to build 16102939 — that build ID will eventually be pruned from ci.android.com (they do not keep artifacts forever), so replace this once it starts 404ing.'
+        description: 'URL for cvd-host_package.tar.gz — either the ci.android.com build-page URL (.../latest/cvd-host_package.tar.gz) or a storage.googleapis.com signed URL both work now; the workflow auto-extracts the real signed link from the ci.android.com page if needed. Whichever kind, it must point at a build that still exists.'
         required: true
-        default: 'https://ci.android.com/builds/submitted/16102939/aosp_cf_x86_64_only_phone-userdebug/latest/cvd-host_package.tar.gz'
+        default: ''
       image_zip_url:
-        description: 'URL to the matching image zip — MUST be the same build ID as host_package_url. Defaults to build 16102939, same expiry caveat as above.'
+        description: 'Same deal as host_package_url — either URL form works, same build ID as host_package_url.'
         required: true
-        default: 'https://ci.android.com/builds/submitted/16102939/aosp_cf_x86_64_only_phone-userdebug/latest/aosp_cf_x86_64_only_phone-img-16102939.zip'
+        default: ''
       instance_name:
         description: 'Label for this instance (cosmetic only, shows up in logs)'
         required: false
@@ -128,6 +147,35 @@ jobs:
           sudo chown "$(whoami):$(whoami)" "$CF_DIR"
           cd "$CF_DIR"
 
+          # ci.android.com's build-page URLs (the ones with /latest/ in
+          # the path) don't serve the file directly — they serve a
+          # small HTML "Artifact Viewer" page that embeds the real,
+          # currently-valid storage.googleapis.com signed URL as a JS
+          # variable (JSVariables.artifactUrl). Peek at just the first
+          # few KB (a Range request — cheap even against a multi-GB
+          # real file URL, since GCS honors Range) and extract it if
+          # present, so pasting either kind of URL works from here on.
+          resolve_real_url() {
+            local url="$1"
+            local peek
+            peek=$(curl -fsSL --max-time 20 --max-filesize 1048576 -r 0-8191 "$url" 2>/dev/null)
+            if echo "$peek" | grep -q '"artifactUrl"'; then
+              local extracted
+              extracted=$(echo "$peek" | grep -oP '"artifactUrl":"\K[^"]+' | sed 's/\\u0026/\&/g')
+              if [ -n "$extracted" ]; then
+                echo "Resolved a ci.android.com landing page to its real signed artifact URL." >&2
+                echo "$extracted"
+                return 0
+              fi
+            fi
+            echo "$url"
+          }
+
+          echo "Resolving host_package_url..."
+          HOST_PACKAGE_URL=$(resolve_real_url "$HOST_PACKAGE_URL")
+          echo "Resolving image_zip_url..."
+          IMAGE_ZIP_URL=$(resolve_real_url "$IMAGE_ZIP_URL")
+
           echo "Downloading host package (aria2 -> wget -> curl fallback)..."
           DOWNLOAD_OK=false
           if aria2c -x 16 -s 16 -d "$CF_DIR" -o host_package.tar.gz "$HOST_PACKAGE_URL"; then
@@ -142,6 +190,20 @@ jobs:
             exit 1
           fi
 
+          # A "successful" download of an HTML landing page (e.g. the
+          # ci.android.com build page itself, instead of the actual
+          # signed googleapis.com file URL) still exits 0 and produces
+          # a non-empty file — this is exactly what happens if the
+          # wrong kind of link gets pasted in, and it fails later with
+          # a confusing tar/gzip error instead of a clear one. Catch it
+          # here instead.
+          HOST_PACKAGE_TYPE=$(file -b --mime-type host_package.tar.gz)
+          if [[ "$HOST_PACKAGE_TYPE" != *"gzip"* ]]; then
+            echo "::error::host_package.tar.gz isn't actually gzip (detected: $HOST_PACKAGE_TYPE). host_package_url almost certainly points at an HTML landing page instead of the real file — use the direct storage.googleapis.com signed URL (visible when you click the filename in a browser), not the ci.android.com page URL."
+            head -c 500 host_package.tar.gz
+            exit 1
+          fi
+
           echo "Downloading device image (aria2 -> wget -> curl fallback)..."
           DOWNLOAD_OK=false
           if aria2c -x 16 -s 16 -d "$CF_DIR" -o device_image.zip "$IMAGE_ZIP_URL"; then
@@ -153,6 +215,13 @@ jobs:
           fi
           if [ "$DOWNLOAD_OK" = false ] || [ ! -s device_image.zip ]; then
             echo "::error::Device image download failed or produced an empty file. Check image_zip_url."
+            exit 1
+          fi
+
+          IMAGE_ZIP_TYPE=$(file -b --mime-type device_image.zip)
+          if [[ "$IMAGE_ZIP_TYPE" != *"zip"* ]]; then
+            echo "::error::device_image.zip isn't actually a zip (detected: $IMAGE_ZIP_TYPE). image_zip_url almost certainly points at an HTML landing page instead of the real file — use the direct storage.googleapis.com signed URL, not the ci.android.com page URL."
+            head -c 500 device_image.zip
             exit 1
           fi
 
