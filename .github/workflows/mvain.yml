@@ -1,0 +1,282 @@
+# ============================================================
+# CHANGELOG (manual — keep this updated as you iterate)
+#
+# V1.0
+# - Set fixed defaults for host_package_url/image_zip_url (build
+#   16102939), so it works out of the box without typing URLs in
+#   every run. Both inputs are still overridable — when this
+#   build eventually gets pruned from ci.android.com (they don't
+#   retain artifacts indefinitely) and starts 404ing, grab a new
+#   pair from the same build ID at
+#   https://ci.android.com/builds/branches/aosp-main/grid?legacy=1
+#   and update the defaults, or just override per-run.
+# - Initial version. Native install (cuttlefish-base/user/
+#   orchestration via apt), no Docker — matches your preference
+#   for using the actual tooling directly rather than wrapping it.
+# - Host package and device image are required inputs, not
+#   hardcoded: ci.android.com build IDs rotate multiple times a
+#   day, so anything baked into this file would be stale almost
+#   immediately. Grab current links from
+#   https://ci.android.com/builds/branches/aosp-main/grid?legacy=1
+#   (search "aosp_cf_x86_64_phone-userdebug", take the
+#   cvd-host_package.tar.gz and the *-img-*.zip from the same
+#   build ID row).
+# - Groups (kvm/cvdnetwork/render) get added in their own step
+#   before anything that needs them — GitHub Actions spawns a
+#   fresh process per step, so this "just works" without
+#   newgrp/relogin the way it would need to on a normal desktop
+#   session.
+# - aria2 -> wget -> curl fallback chain for both downloads,
+#   same pattern as Qemu-Vortax, since these files can be
+#   multiple GB.
+# - CF_DIR lives on /mnt (the larger secondary disk on GitHub-
+#   hosted runners), not $HOME, and is chown'd to the actual
+#   runner user rather than chmod 777'd — cleaner than the
+#   world-writable approach, avoids the whole "sudo doesn't
+#   cover shell redirects into a root-owned dir" bug class.
+# ============================================================
+
+name: Android-Cuttlefish
+
+on:
+  workflow_dispatch:
+    inputs:
+      host_package_url:
+        description: 'URL to cvd-host_package.tar.gz. Defaults to build 16102939 — that build ID will eventually be pruned from ci.android.com (they do not keep artifacts forever), so replace this once it starts 404ing.'
+        required: true
+        default: 'https://ci.android.com/builds/submitted/16102939/aosp_cf_x86_64_only_phone-userdebug/latest/cvd-host_package.tar.gz'
+      image_zip_url:
+        description: 'URL to the matching image zip — MUST be the same build ID as host_package_url. Defaults to build 16102939, same expiry caveat as above.'
+        required: true
+        default: 'https://ci.android.com/builds/submitted/16102939/aosp_cf_x86_64_only_phone-userdebug/latest/aosp_cf_x86_64_only_phone-img-16102939.zip'
+      instance_name:
+        description: 'Label for this instance (cosmetic only, shows up in logs)'
+        required: false
+        default: 'cvd-1'
+      start_webrtc:
+        description: 'Start the WebRTC operator UI (yes/no) — this is how you actually see/use the device remotely'
+        required: true
+        default: 'yes'
+      connection_method:
+        description: 'Choose connection method: tailscale or ngrok or bore'
+        required: true
+        default: 'tailscale'
+      runtime:
+        description: 'Runtime duration in minutes before the session ends'
+        required: false
+        default: '325'
+
+permissions:
+  contents: read
+
+jobs:
+  setup-and-run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+      NGROK_AUTH: ${{ secrets.NGROK_AUTH }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check for KVM (nested virtualization)
+        run: |
+          if [ ! -e /dev/kvm ]; then
+            echo "::error::/dev/kvm not found on this runner — Cuttlefish needs real nested virtualization, this can't proceed without it."
+            exit 1
+          fi
+          ls -l /dev/kvm
+          echo "KVM device present."
+
+      - name: Add Cuttlefish apt repo and install packages
+        run: |
+          echo "Adding Google Artifact Registry signing key..."
+          sudo curl -fsSL https://us-apt.pkg.dev/doc/repo-signing-key.gpg \
+            -o /etc/apt/trusted.gpg.d/artifact-registry.asc
+          sudo chmod a+r /etc/apt/trusted.gpg.d/artifact-registry.asc
+
+          echo "Adding Cuttlefish apt source..."
+          echo "deb https://us-apt.pkg.dev/projects/android-cuttlefish-artifacts android-cuttlefish main" \
+            | sudo tee -a /etc/apt/sources.list.d/artifact-registry.list > /dev/null
+
+          echo "Updating package lists..."
+          sudo apt update -qq
+
+          echo "Installing Cuttlefish packages..."
+          sudo apt install -y cuttlefish-base cuttlefish-user cuttlefish-orchestration
+
+          echo "Installing download/extraction/adb tooling..."
+          sudo apt install -y aria2 adb unzip
+
+      - name: Add runner user to Cuttlefish groups
+        run: |
+          sudo usermod -aG kvm,cvdnetwork,render "$(whoami)"
+          echo "Added $(whoami) to kvm, cvdnetwork, render."
+          echo "Every step after this one runs as a fresh process, so"
+          echo "these group memberships are already active for them —"
+          echo "no newgrp or relogin needed here, unlike testing this"
+          echo "by hand in an already-open terminal session."
+
+      - name: Download Cuttlefish host package and device image
+        run: |
+          HOST_PACKAGE_URL="${{ github.event.inputs.host_package_url }}"
+          IMAGE_ZIP_URL="${{ github.event.inputs.image_zip_url }}"
+          CF_DIR="/mnt/cuttlefish"
+
+          sudo mkdir -p "$CF_DIR"
+          sudo chown "$(whoami):$(whoami)" "$CF_DIR"
+          cd "$CF_DIR"
+
+          echo "Downloading host package (aria2 -> wget -> curl fallback)..."
+          DOWNLOAD_OK=false
+          if aria2c -x 16 -s 16 -d "$CF_DIR" -o host_package.tar.gz "$HOST_PACKAGE_URL"; then
+            DOWNLOAD_OK=true
+          elif wget -O host_package.tar.gz "$HOST_PACKAGE_URL"; then
+            DOWNLOAD_OK=true
+          elif curl -fSL -o host_package.tar.gz "$HOST_PACKAGE_URL"; then
+            DOWNLOAD_OK=true
+          fi
+          if [ "$DOWNLOAD_OK" = false ] || [ ! -s host_package.tar.gz ]; then
+            echo "::error::Host package download failed or produced an empty file. Check host_package_url."
+            exit 1
+          fi
+
+          echo "Downloading device image (aria2 -> wget -> curl fallback)..."
+          DOWNLOAD_OK=false
+          if aria2c -x 16 -s 16 -d "$CF_DIR" -o device_image.zip "$IMAGE_ZIP_URL"; then
+            DOWNLOAD_OK=true
+          elif wget -O device_image.zip "$IMAGE_ZIP_URL"; then
+            DOWNLOAD_OK=true
+          elif curl -fSL -o device_image.zip "$IMAGE_ZIP_URL"; then
+            DOWNLOAD_OK=true
+          fi
+          if [ "$DOWNLOAD_OK" = false ] || [ ! -s device_image.zip ]; then
+            echo "::error::Device image download failed or produced an empty file. Check image_zip_url."
+            exit 1
+          fi
+
+          echo "Extracting host package..."
+          tar -xzf host_package.tar.gz
+
+          echo "Extracting device image..."
+          unzip -q device_image.zip
+
+          echo "Contents of $CF_DIR:"
+          ls -la "$CF_DIR"
+
+      - name: Setup Connection (Tailscale, Ngrok, or Bore)
+        run: |
+          METHOD="${{ github.event.inputs.connection_method }}"
+          if [ "$METHOD" = "tailscale" ]; then
+            echo "Installing Tailscale (with Tailscale SSH enabled)..."
+            curl -fsSL https://tailscale.com/install.sh | sudo sh > /dev/null 2>&1
+            sudo tailscale up --authkey "${TAILSCALE_AUTHKEY}" --hostname "gh-cuttlefish-${{ github.run_id }}" --accept-routes --accept-dns=false --ssh
+            TS_IP=$(sudo tailscale ip -4 | head -n1)
+            echo "CONNECTION_IP=$TS_IP" >> $GITHUB_ENV
+            echo "CONNECTION_TYPE=Tailscale" >> $GITHUB_ENV
+          elif [ "$METHOD" = "ngrok" ]; then
+            echo "Downloading Ngrok..."
+            wget -q -O ngrok.zip https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-linux-amd64.zip
+            unzip -q ngrok.zip
+            sudo mv ngrok /usr/local/bin/
+            ngrok config add-authtoken "${NGROK_AUTH}"
+            echo "CONNECTION_TYPE=Ngrok" >> $GITHUB_ENV
+          elif [ "$METHOD" = "bore" ]; then
+            echo "Installing bore-cli..."
+            cargo install bore-cli > /dev/null 2>&1
+            echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+            echo "CONNECTION_TYPE=Bore" >> $GITHUB_ENV
+          else
+            echo "::error::Invalid connection_method."
+            exit 1
+          fi
+
+          echo "Configuring firewall for the WebRTC operator UI (port 8443)..."
+          sudo apt install -y -qq ufw > /dev/null 2>&1 || true
+          sudo ufw allow 8443/tcp > /dev/null 2>&1 || true
+          sudo ufw --force enable > /dev/null 2>&1 || true
+
+      - name: Launch Cuttlefish
+        run: |
+          CF_DIR="/mnt/cuttlefish"
+          START_WEBRTC="${{ github.event.inputs.start_webrtc }}"
+          INSTANCE_NAME="${{ github.event.inputs.instance_name }}"
+
+          cd "$CF_DIR"
+
+          WEBRTC_FLAG="--start_webrtc=false"
+          if [ "$START_WEBRTC" != "no" ]; then
+            WEBRTC_FLAG="--start_webrtc=true"
+          fi
+
+          echo "Launching Cuttlefish instance '$INSTANCE_NAME'..."
+          HOME="$CF_DIR" ./bin/launch_cvd --daemon "$WEBRTC_FLAG" --report_anonymous_usage_stats=n
+
+          echo "Waiting for the device to come up..."
+          sleep 20
+          HOME="$CF_DIR" ./bin/adb devices
+
+      - name: Expose port 8443 with Tunnel
+        if: ${{ github.event.inputs.connection_method == 'ngrok' || github.event.inputs.connection_method == 'bore' }}
+        run: |
+          METHOD="${{ github.event.inputs.connection_method }}"
+
+          if [ "$METHOD" = "ngrok" ]; then
+            echo "Starting Ngrok tunnel for the WebRTC UI (port 8443)..."
+            nohup ngrok tcp 8443 --region=eu > ngrok_log.log 2>&1 &
+            sleep 10
+            curl --silent http://127.0.0.1:4040/api/tunnels > tunnels.json
+            TUNNEL_URL=$(jq -r '.tunnels[] | select(.config.addr=="localhost:8443") | .public_url' tunnels.json)
+            if [ -z "$TUNNEL_URL" ]; then
+              echo "::error::Failed to get Ngrok public address."
+              exit 1
+            fi
+            echo "CONNECTION_IP=$TUNNEL_URL" >> $GITHUB_ENV
+            echo "WebRTC UI (Ngrok): $TUNNEL_URL"
+
+          elif [ "$METHOD" = "bore" ]; then
+            echo "Starting Bore tunnel for the WebRTC UI (port 8443)..."
+            nohup bore local 8443 --to bore.pub > bore_log.log 2>&1 &
+            sleep 5
+            TUNNEL_INFO=$(grep "listening at bore.pub" bore_log.log | tail -n 1)
+            TUNNEL_IP=$(echo "$TUNNEL_INFO" | grep -Eo 'bore.pub:[0-9]+')
+            if [ -z "$TUNNEL_IP" ]; then
+              echo "::error::Failed to get Bore public address."
+              sudo pkill -f 'bore local' || true
+              exit 1
+            fi
+            echo "CONNECTION_IP=$TUNNEL_IP" >> $GITHUB_ENV
+            echo "WebRTC UI (Bore): $TUNNEL_IP"
+          fi
+
+      - name: Connection Information and Keep Alive
+        run: |
+          echo "=== CUTTLEFISH CONNECTION INFO ==="
+          CONNECTION_TYPE="${{ env.CONNECTION_TYPE }}"
+          CONNECTION_IP="${{ env.CONNECTION_IP }}"
+
+          if [ "$CONNECTION_TYPE" = "Tailscale" ]; then
+            echo ">>> WebRTC UI: https://$CONNECTION_IP:8443"
+            echo ">>> SSH (no password, tailnet identity): tailscale ssh $(whoami)@gh-cuttlefish-${{ github.run_id }}"
+          elif [ "$CONNECTION_TYPE" = "Ngrok" ] || [ "$CONNECTION_TYPE" = "Bore" ]; then
+            echo ">>> WebRTC UI tunnel: $CONNECTION_IP (this is a raw TCP tunnel to port 8443 — connect there over HTTPS)"
+          else
+            echo "Connection setup failed or was not selected."
+          fi
+          echo
+          echo "NOTE: the WebRTC UI serves a self-signed cert by default —"
+          echo "your browser will warn about it, that's expected here."
+
+          RUNTIME="${{ github.event.inputs.runtime }}"
+          echo "Keeping the session alive for ${RUNTIME} minutes..."
+          sleep $((RUNTIME * 60))
+          echo "Session ended after ${RUNTIME} minutes."
+
+      - name: Stop Cuttlefish
+        if: always()
+        run: |
+          CF_DIR="/mnt/cuttlefish"
+          if [ -d "$CF_DIR" ] && [ -x "$CF_DIR/bin/stop_cvd" ]; then
+            HOME="$CF_DIR" "$CF_DIR/bin/stop_cvd" || true
+          fi
