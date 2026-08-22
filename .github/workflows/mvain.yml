@@ -55,7 +55,7 @@
 #   cover shell redirects into a root-owned dir" bug class.
 # ============================================================
 
-name: Android-Cuttlefish new
+name: Android-Cuttlefish
 
 on:
   workflow_dispatch:
@@ -63,11 +63,11 @@ on:
       host_package_url:
         description: 'URL for cvd-host_package.tar.gz — either the ci.android.com build-page URL (.../latest/cvd-host_package.tar.gz) or a storage.googleapis.com signed URL both work now; the workflow auto-extracts the real signed link from the ci.android.com page if needed. Whichever kind, it must point at a build that still exists.'
         required: true
-        default: ''
+        default: 'https://ci.android.com/builds/submitted/16102939/aosp_cf_x86_64_only_phone-userdebug/latest/cvd-host_package.tar.gz'
       image_zip_url:
         description: 'Same deal as host_package_url — either URL form works, same build ID as host_package_url.'
         required: true
-        default: ''
+        default: 'https://ci.android.com/builds/submitted/16102939/aosp_cf_x86_64_only_phone-userdebug/latest/aosp_cf_x86_64_only_phone-img-16102939.zip'
       instance_name:
         description: 'Label for this instance (cosmetic only, shows up in logs)'
         required: false
@@ -79,11 +79,11 @@ on:
       connection_method:
         description: 'Choose connection method: tailscale or ngrok or bore'
         required: true
-        default: 'tailscale'
+        default: 'bore'
       runtime:
         description: 'Runtime duration in minutes before the session ends'
         required: false
-        default: '325'
+        default: '350'
 
 permissions:
   contents: read
@@ -280,11 +280,11 @@ jobs:
           fi
 
           echo "Launching Cuttlefish instance '$INSTANCE_NAME'..."
-          HOME="$CF_DIR" ./bin/launch_cvd --daemon "$WEBRTC_FLAG" --report_anonymous_usage_stats=n
+          HOME="$CF_DIR" sudo ./bin/launch_cvd --daemon "$WEBRTC_FLAG" --report_anonymous_usage_stats=n
 
           echo "Waiting for the device to come up..."
           sleep 20
-          HOME="$CF_DIR" ./bin/adb devices
+          HOME="$CF_DIR" sudo ./bin/adb devices
 
       - name: Expose port 8443 with Tunnel
         if: ${{ github.event.inputs.connection_method == 'ngrok' || github.event.inputs.connection_method == 'bore' }}
